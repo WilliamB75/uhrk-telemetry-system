@@ -19,8 +19,8 @@ cd uhrk-telemetry-system
 ```
 
 Pi passwords, private keys, and live flight logs are intentionally not stored in
-this repository. Give Codex the current device access details again on the new
-machine when you want it to deploy or inspect the Pis.
+this repository. Ask the team lead for the relevant device access details when
+deployment or Pi inspection is required.
 
 ## Current Dashboard
 
