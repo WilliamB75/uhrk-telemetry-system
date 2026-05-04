@@ -52,6 +52,8 @@ class Config:
     # intentionally conservative; you may tune them after flight testing.
     BURN_ACTIVE_ACC_THRESHOLD: float = 15.0  # m/s² above gravity for burnActive
     BURN_OUT_ACC_THRESHOLD: float = 3.0       # m/s² threshold indicating burn end
+    LAUNCH_CONFIRM_SAMPLES: int = 3
+    MIN_LAUNCH_ALTITUDE_DELTA: float = 8.0
     STAGE_SEP_ALTITUDE: float = 3000.0        # m altitude to flag stage separation
     DROGUE_DROP_ALT: float = 50.0             # m drop from apogee to deploy drogue
     MAIN_DEPLOY_ALTITUDE: float = 500.0       # m altitude to deploy main chute

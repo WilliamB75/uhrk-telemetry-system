@@ -45,6 +45,14 @@ NODE_CONTROL_URLS = [
     for url in os.environ.get("UHRK_NODE_CONTROL_URLS", "http://10.42.0.78:8091/api/shutdown").split(",")
     if url.strip()
 ]
+NODE_TIME_SYNC_URLS = [
+    url.strip()
+    for url in os.environ.get(
+        "UHRK_NODE_TIME_SYNC_URLS",
+        ",".join(url.rsplit("/", 1)[0] + "/time-sync" for url in NODE_CONTROL_URLS),
+    ).split(",")
+    if url.strip()
+]
 SHUTDOWN_PHRASE = os.environ.get("UHRK_SHUTDOWN_PHRASE", "SHUTDOWN UHRK")
 LOG_DIR = Path(os.environ.get("UHRK_FLIGHT_LOG_DIR", str(Path(__file__).resolve().parent / "flight_logs")))
 SETTINGS_FILE = Path(os.environ.get("UHRK_SETTINGS_FILE", str(Path(__file__).resolve().parent / "event_settings.json")))
@@ -54,6 +62,9 @@ LINEAR_ACCEL_DEADBAND = float(os.environ.get("UHRK_LINEAR_ACCEL_DEADBAND", "0.25
 VELOCITY_SMOOTHING_ALPHA = float(os.environ.get("UHRK_VELOCITY_SMOOTHING_ALPHA", "0.22"))
 ALTITUDE_NOISE_DEADBAND_M = float(os.environ.get("UHRK_ALTITUDE_NOISE_DEADBAND_M", "0.35"))
 STATIONARY_VELOCITY_DEADBAND_MPS = float(os.environ.get("UHRK_STATIONARY_VELOCITY_DEADBAND_MPS", "0.35"))
+MAX_BARO_STEP_M = float(os.environ.get("UHRK_MAX_BARO_STEP_M", "25.0"))
+MAX_GPS_STEP_M = float(os.environ.get("UHRK_MAX_GPS_STEP_M", "35.0"))
+MAX_GPS_ALT_STEP_M = float(os.environ.get("UHRK_MAX_GPS_ALT_STEP_M", "30.0"))
 
 PUSH_DATA = 0x00
 PUSH_ACK = 0x01
@@ -77,6 +88,9 @@ DOWNLINK_REPEATS = int(os.environ.get("UHRK_LORA_DOWNLINK_REPEATS", "3"))
 DOWNLINK_REPEAT_DELAY_S = float(os.environ.get("UHRK_LORA_DOWNLINK_REPEAT_DELAY_S", "1.0"))
 DOWNLINK_READY_TIMEOUT_S = float(os.environ.get("UHRK_LORA_DOWNLINK_READY_TIMEOUT_S", "30"))
 PAD_STATE_CONFIRM_TIMEOUT_S = float(os.environ.get("UHRK_PAD_STATE_CONFIRM_TIMEOUT_S", "3.0"))
+GC_TIME_SYNC_INTERVAL_S = float(os.environ.get("UHRK_GC_TIME_SYNC_INTERVAL_S", "300"))
+NODE_TIME_SYNC_INTERVAL_S = float(os.environ.get("UHRK_NODE_TIME_SYNC_INTERVAL_S", "60"))
+GPS_TIME_MAX_AGE_S = float(os.environ.get("UHRK_GPS_TIME_MAX_AGE_S", "120"))
 
 STAGE_NAMES: Dict[int, str] = {
     0: "Booster",
@@ -140,6 +154,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "velocitySmoothingAlpha": VELOCITY_SMOOTHING_ALPHA,
         "altitudeNoiseDeadbandM": ALTITUDE_NOISE_DEADBAND_M,
         "stationaryVelocityDeadbandMps": STATIONARY_VELOCITY_DEADBAND_MPS,
+        "maxBaroStepM": MAX_BARO_STEP_M,
+        "maxGpsStepM": MAX_GPS_STEP_M,
+        "maxGpsAltStepM": MAX_GPS_ALT_STEP_M,
     },
     "events": [
         {"id": "launch", "label": "Launch detect", "stage": "All", "accelAboveG": 2.5, "minDurationMs": 120},
@@ -384,6 +401,9 @@ class StageState:
     linearAccel: Optional[float] = None
     gpsStatus: Optional[str] = None
     sats: Optional[int] = None
+    satsUsed: Optional[int] = None
+    satsInView: Optional[int] = None
+    gpsQuality: Optional[str] = None
     ax: Optional[float] = None
     ay: Optional[float] = None
     az: Optional[float] = None
@@ -403,6 +423,12 @@ class StageState:
     last_update_mono: float = 0.0
     last_update_utc: Optional[str] = None
     prev_event_mask: int = 0
+    _accepted_baro_alt: Optional[float] = None
+    _accepted_gps_alt: Optional[float] = None
+    _accepted_lat: Optional[float] = None
+    _accepted_lon: Optional[float] = None
+    _last_rejection: Optional[str] = None
+    _last_gps_rejection: Optional[str] = None
 
     def apply_altitude_zero(self, zero: Dict[str, Any]) -> None:
         self.altitudeZero = {
@@ -422,6 +448,10 @@ class StageState:
             "setUtc": datetime.now(timezone.utc).isoformat(),
         }
         self.apply_altitude_zero(zero)
+        self.gpsRelAlt = self._relative_altitude("gpsAlt", self.gpsAlt)
+        self.baroRelAlt = self._relative_altitude("baroAlt", self.baroAlt)
+        self.imuRelAlt = self._relative_altitude("imuAlt", self.imuAlt)
+        self.fusedRelAlt = self._relative_altitude("fusedAlt", self.fusedAlt)
         self.verticalVelocity = 0.0
         self.imuVelocity = 0.0
         self.history = []
@@ -429,6 +459,10 @@ class StageState:
 
     def clear_altitude_zero(self) -> None:
         self.altitudeZero = {}
+        self.gpsRelAlt = self.gpsAlt
+        self.baroRelAlt = self.baroAlt
+        self.imuRelAlt = self.imuAlt
+        self.fusedRelAlt = self.fusedAlt
         self.verticalVelocity = 0.0
         self.imuVelocity = 0.0
         self.history = []
@@ -439,8 +473,36 @@ class StageState:
         zero = _maybe_float(self.altitudeZero.get(key)) if self.altitudeZero else None
         return value - zero if zero is not None else value
 
+    def _accept_baro_altitude(self, value: float, max_step_m: float) -> float:
+        if self._accepted_baro_alt is None or max_step_m <= 0:
+            self._accepted_baro_alt = value
+            return value
+        if abs(value - self._accepted_baro_alt) <= max_step_m:
+            self._accepted_baro_alt = value
+            return value
+        self._last_rejection = f"baro jump {value - self._accepted_baro_alt:.1f} m"
+        return self._accepted_baro_alt
+
+    def _accept_gps(self, lat: float, lon: float, alt: float, gps_status_code: int, sats_used: int, max_step_m: float, max_alt_step_m: float) -> bool:
+        if gps_status_code < 2 or sats_used < 4 or abs(lat) < 0.000001 or abs(lon) < 0.000001:
+            self._last_gps_rejection = "not enough GPS quality"
+            return False
+        if self._accepted_lat is not None and self._accepted_lon is not None and max_step_m > 0:
+            if haversine_m(self._accepted_lat, self._accepted_lon, lat, lon) > max_step_m:
+                self._last_gps_rejection = "gps position jump"
+                return False
+        if self._accepted_gps_alt is not None and max_alt_step_m > 0:
+            if abs(alt - self._accepted_gps_alt) > max_alt_step_m:
+                self._last_gps_rejection = f"gps altitude jump {alt - self._accepted_gps_alt:.1f} m"
+                return False
+        self._accepted_lat = lat
+        self._accepted_lon = lon
+        self._accepted_gps_alt = alt
+        self._last_gps_rejection = None
+        return True
+
     def _update_readiness(self, now: float) -> None:
-        gps_ready = self.gpsStatus == "3D fix" and (self.sats or 0) >= 4
+        gps_ready = self.gpsStatus == "3D fix" and (self.satsUsed or 0) >= 4
         link_ready = self.rssi is not None and self.snr is not None and self.snr > -5
         zero_ready = bool(self.altitudeZero.get("setUtc")) if self.altitudeZero else False
         velocity_ready = self.verticalVelocity is not None and abs(self.verticalVelocity) < 1.5
@@ -462,13 +524,27 @@ class StageState:
         linear_accel_deadband = sensor_float("linearAccelDeadbandMps2", LINEAR_ACCEL_DEADBAND)
         altitude_noise_deadband = max(0.0, sensor_float("altitudeNoiseDeadbandM", ALTITUDE_NOISE_DEADBAND_M))
         stationary_velocity_deadband = max(0.0, sensor_float("stationaryVelocityDeadbandMps", STATIONARY_VELOCITY_DEADBAND_MPS))
+        max_baro_step_m = max(0.0, sensor_float("maxBaroStepM", MAX_BARO_STEP_M))
+        max_gps_step_m = max(0.0, sensor_float("maxGpsStepM", MAX_GPS_STEP_M))
+        max_gps_alt_step_m = max(0.0, sensor_float("maxGpsAltStepM", MAX_GPS_ALT_STEP_M))
         self.seq = int(decoded["seq"])
-        self.lat = float(decoded["lat"])
-        self.lon = float(decoded["lon"])
-        self.gpsAlt = float(decoded["gps_alt_m"])
-        self.baroAlt = float(decoded["baro_alt_m"])
+        self._last_rejection = None
+        self._last_gps_rejection = None
+        raw_lat = float(decoded["lat"])
+        raw_lon = float(decoded["lon"])
+        raw_gps_alt = float(decoded["gps_alt_m"])
+        raw_baro_alt = float(decoded["baro_alt_m"])
+        self.gpsAlt = raw_gps_alt
+        self.baroAlt = self._accept_baro_altitude(raw_baro_alt, max_baro_step_m)
         self.imuAlt = float(decoded["imu_alt_m"])
         gps_status_code = int(decoded["gps_status"])
+        self.sats = int(decoded.get("sats", 0))
+        self.satsUsed = int(decoded.get("sats_used", self.sats if gps_status_code > 0 and self.sats <= 15 else 0))
+        self.satsInView = int(decoded.get("sats_in_view", self.sats))
+        gps_accepted = self._accept_gps(raw_lat, raw_lon, raw_gps_alt, gps_status_code, self.satsUsed or 0, max_gps_step_m, max_gps_alt_step_m)
+        self.gpsQuality = "accepted" if gps_accepted else (self._last_gps_rejection or "not used")
+        self.lat = self._accepted_lat if self._accepted_lat is not None else raw_lat
+        self.lon = self._accepted_lon if self._accepted_lon is not None else raw_lon
         if gps_status_code == 0:
             self.gpsStatus = "No fix"
         elif gps_status_code == 1:
@@ -480,15 +556,11 @@ class StageState:
         # Keep IMU altitude visible, but exclude it from fused altitude for now.
         # The accelerometer frame is not yet aligned/calibrated well enough for
         # double-integrated altitude to improve the live flight estimate.
-        if gps_status_code >= 2:
-            self.fusedAlt = self.gpsAlt * 0.30 + self.baroAlt * 0.70
-        else:
-            self.fusedAlt = self.baroAlt
+        self.fusedAlt = self.baroAlt
         self.gpsRelAlt = self._relative_altitude("gpsAlt", self.gpsAlt)
         self.baroRelAlt = self._relative_altitude("baroAlt", self.baroAlt)
         self.imuRelAlt = self._relative_altitude("imuAlt", self.imuAlt)
         self.fusedRelAlt = self._relative_altitude("fusedAlt", self.fusedAlt)
-        self.sats = int(decoded["sats"])
         self.ax = float(decoded["ax"])
         self.ay = float(decoded["ay"])
         self.az = float(decoded["az"])
@@ -551,6 +623,7 @@ class StageState:
             "imuVelocity": self.imuVelocity,
             "accelMagnitude": self.accelMagnitude,
             "linearAccel": self.linearAccel,
+            "gpsQuality": self.gpsQuality,
             "ax": self.ax,
             "ay": self.ay,
             "az": self.az,
@@ -593,6 +666,9 @@ class StageState:
             "linearAccel": self.linearAccel,
             "gpsStatus": self.gpsStatus,
             "sats": self.sats,
+            "satsUsed": self.satsUsed,
+            "satsInView": self.satsInView,
+            "gpsQuality": self.gpsQuality,
             "ax": self.ax,
             "ay": self.ay,
             "az": self.az,
@@ -639,6 +715,77 @@ def _nmea_coord(value: str, hemisphere: str) -> Optional[float]:
         return None
 
 
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_m = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2
+    return 2.0 * radius_m * math.asin(math.sqrt(a))
+
+
+def _parse_nmea_datetime(time_field: str, date_field: str) -> Optional[datetime]:
+    if not time_field or not date_field or len(date_field) != 6:
+        return None
+    try:
+        hour = int(time_field[0:2])
+        minute = int(time_field[2:4])
+        second = int(float(time_field[4:]))
+        day = int(date_field[0:2])
+        month = int(date_field[2:4])
+        year_2 = int(date_field[4:6])
+        year = 2000 + year_2 if year_2 < 80 else 1900 + year_2
+        stamp = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (2024 <= stamp.year <= 2035):
+        return None
+    return stamp
+
+
+def _parse_nmea_zda(parts: List[str]) -> Optional[datetime]:
+    if len(parts) < 5 or not parts[1] or not parts[2] or not parts[3] or not parts[4]:
+        return None
+    try:
+        hour = int(parts[1][0:2])
+        minute = int(parts[1][2:4])
+        second = int(float(parts[1][4:]))
+        day = int(parts[2])
+        month = int(parts[3])
+        year = int(parts[4])
+        stamp = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (2024 <= stamp.year <= 2035):
+        return None
+    return stamp
+
+
+def set_system_time_from_epoch(epoch: float) -> Dict[str, object]:
+    if epoch < 1700000000 or epoch > 2200000000:
+        return {"ok": False, "error": "epoch outside expected range"}
+    last_error = "date command unavailable"
+    for command in (
+        ["sudo", "/usr/bin/date", "-u", "-s", f"@{epoch:.3f}"],
+        ["sudo", "/bin/date", "-u", "-s", f"@{epoch:.3f}"],
+    ):
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_error = str(exc)
+            continue
+        if result.returncode == 0:
+            return {
+                "ok": True,
+                "epoch": epoch,
+                "systemUtc": datetime.now(timezone.utc).isoformat(),
+                "stdout": result.stdout.strip(),
+            }
+        last_error = result.stderr.strip() or result.stdout.strip() or f"date exited {result.returncode}"
+    return {"ok": False, "error": last_error}
+
+
 class GroundGpsReader:
     def __init__(self, port: str, baud: int = 9600) -> None:
         self.port = port
@@ -651,6 +798,10 @@ class GroundGpsReader:
             "lon": None,
             "altitudeM": None,
             "lastGpsUtc": None,
+            "gpsTimeUtc": None,
+            "gpsTimeEpoch": None,
+            "gpsTimeMono": None,
+            "gpsTimeSource": None,
         }
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
@@ -704,6 +855,38 @@ class GroundGpsReader:
         line = line[start:]
         parts = line.split(",")
         sentence = parts[0][-3:]
+        if sentence == "RMC" and len(parts) >= 10:
+            stamp = _parse_nmea_datetime(parts[1], parts[9])
+            if stamp is not None:
+                with self._lock:
+                    self._latest.update({
+                        "gpsTimeUtc": stamp.isoformat(),
+                        "gpsTimeEpoch": stamp.timestamp(),
+                        "gpsTimeMono": time.monotonic(),
+                        "gpsTimeSource": "RMC",
+                    })
+            lat = _nmea_coord(parts[3], parts[4]) if len(parts) > 5 else None
+            lon = _nmea_coord(parts[5], parts[6]) if len(parts) > 6 else None
+            if parts[2] == "A" and lat is not None and lon is not None:
+                with self._lock:
+                    self._latest.update({
+                        "gpsStatus": "Fix",
+                        "lat": lat,
+                        "lon": lon,
+                        "lastGpsUtc": datetime.now(timezone.utc).isoformat(),
+                    })
+            return
+        if sentence == "ZDA":
+            stamp = _parse_nmea_zda(parts)
+            if stamp is not None:
+                with self._lock:
+                    self._latest.update({
+                        "gpsTimeUtc": stamp.isoformat(),
+                        "gpsTimeEpoch": stamp.timestamp(),
+                        "gpsTimeMono": time.monotonic(),
+                        "gpsTimeSource": "ZDA",
+                    })
+            return
         if sentence == "GGA" and len(parts) >= 10:
             lat = _nmea_coord(parts[2], parts[3])
             lon = _nmea_coord(parts[4], parts[5])
@@ -755,7 +938,7 @@ def decode_payload(payload: bytes) -> Optional[Dict[str, object]]:
         baro_i,
         imu_i,
         gps_status,
-        sats,
+        sats_encoded,
         ax_i,
         ay_i,
         az_i,
@@ -764,6 +947,12 @@ def decode_payload(payload: bytes) -> Optional[Dict[str, object]]:
         gz_i,
         event_flags,
     ) = fields
+    if sats_encoded <= 15:
+        sats_used = sats_encoded if gps_status > 0 else 0
+        sats_in_view = sats_encoded
+    else:
+        sats_used = sats_encoded & 0x0F
+        sats_in_view = (sats_encoded >> 4) & 0x0F
     return {
         "device_id": device_id,
         "seq": seq,
@@ -773,7 +962,9 @@ def decode_payload(payload: bytes) -> Optional[Dict[str, object]]:
         "baro_alt_m": baro_i / 100.0,
         "imu_alt_m": imu_i / 100.0,
         "gps_status": gps_status,
-        "sats": sats,
+        "sats": sats_encoded,
+        "sats_used": sats_used,
+        "sats_in_view": sats_in_view,
         "ax": ax_i / 10.0,
         "ay": ay_i / 10.0,
         "az": az_i / 10.0,
@@ -961,6 +1152,41 @@ def request_node_shutdown(url: str, dry_run: bool) -> Dict[str, object]:
         return {"url": url, "ok": False, "error": str(exc)}
 
 
+def request_node_time_sync(url: str, epoch: float, source: str = "gc_gps") -> Dict[str, object]:
+    body = json.dumps({
+        "epoch": epoch,
+        "utc": datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
+        "source": source,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return {
+                "url": url,
+                "ok": 200 <= response.status < 300,
+                "status": response.status,
+                "response": json.loads(response.read().decode("utf-8") or "{}"),
+            }
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return {"url": url, "ok": False, "error": str(exc)}
+
+
+def current_gps_epoch(ground_station: Dict[str, object], now: float) -> Optional[float]:
+    epoch = _maybe_float(ground_station.get("gpsTimeEpoch"))
+    mono = _maybe_float(ground_station.get("gpsTimeMono"))
+    if epoch is None or mono is None:
+        return None
+    age = now - mono
+    if age < 0 or age > GPS_TIME_MAX_AGE_S:
+        return None
+    return epoch + age
+
+
 def run_shutdown_after_delay(delay_s: float) -> None:
     def worker() -> None:
         time.sleep(delay_s)
@@ -1008,6 +1234,16 @@ def start_control_server(
             if path == "/api/altitude-zero":
                 self._send_json(200, altitude_zero_snapshot(stages, time.monotonic()))
                 return
+            if path == "/api/time-sync/status":
+                self._send_json(200, {
+                    "ok": True,
+                    "systemUtc": datetime.now(timezone.utc).isoformat(),
+                    "gpsTimeUtc": ground_station.get("gpsTimeUtc"),
+                    "gpsTimeSource": ground_station.get("gpsTimeSource"),
+                    "nodeTimeSyncUrls": NODE_TIME_SYNC_URLS,
+                    "groundStation": ground_station,
+                })
+                return
             if path == "/api/pad-state":
                 now = time.monotonic()
                 self._send_json(200, {
@@ -1035,6 +1271,40 @@ def start_control_server(
 
         def do_POST(self) -> None:
             path = self.path.split("?", 1)[0]
+            if path == "/api/time-sync":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                try:
+                    payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                    return
+                epoch = _maybe_float(payload.get("epoch"))
+                source = str(payload.get("source") or "manual")
+                if epoch is None:
+                    epoch = current_gps_epoch(ground_station, time.monotonic())
+                    source = "gc_gps"
+                if epoch is None:
+                    self._send_json(400, {"ok": False, "error": "no valid time source available"})
+                    return
+                before = datetime.now(timezone.utc).isoformat()
+                gc_result = set_system_time_from_epoch(epoch)
+                node_results = [request_node_time_sync(url, epoch, source) for url in NODE_TIME_SYNC_URLS]
+                response = {
+                    "ok": bool(gc_result.get("ok")) and (all(result.get("ok") for result in node_results) if node_results else True),
+                    "source": source,
+                    "epoch": epoch,
+                    "utc": datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
+                    "gc": gc_result,
+                    "gcBeforeUtc": before,
+                    "nodes": node_results,
+                }
+                flight_log.append("time_sync", {
+                    "remote": self.client_address[0],
+                    "manual": True,
+                    "response": response,
+                })
+                self._send_json(200 if response["ok"] else 500, response)
+                return
             if path == "/api/settings":
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 try:
@@ -1192,6 +1462,10 @@ def main() -> None:
         "lon": None,
         "altitudeM": None,
         "lastStatUtc": None,
+        "gpsTimeUtc": None,
+        "gpsTimeEpoch": None,
+        "gpsTimeMono": None,
+        "gpsTimeSource": None,
     }
     ground_gps = GroundGpsReader(GROUND_GPS_PORT)
     downlink = LoRaDownlink()
@@ -1205,6 +1479,8 @@ def main() -> None:
     print(f"UHRK backend listening on udp://{UDP_HOST}:{UDP_PORT}", flush=True)
 
     last_write = 0.0
+    last_gc_time_sync = 0.0
+    last_node_time_sync = 0.0
     write_json(stages, ground_station, time.monotonic())
 
     try:
@@ -1212,6 +1488,25 @@ def main() -> None:
             now = time.monotonic()
             changed = False
             ground_station.update(ground_gps.snapshot())
+            gps_epoch = current_gps_epoch(ground_station, now)
+            if gps_epoch is not None and (now - last_gc_time_sync) >= GC_TIME_SYNC_INTERVAL_S:
+                result = set_system_time_from_epoch(gps_epoch)
+                flight_log.append("time_sync", {
+                    "target": "ground_station",
+                    "source": "gps",
+                    "epoch": gps_epoch,
+                    "result": result,
+                })
+                last_gc_time_sync = now
+            if gps_epoch is not None and NODE_TIME_SYNC_URLS and (now - last_node_time_sync) >= NODE_TIME_SYNC_INTERVAL_S:
+                node_results = [request_node_time_sync(url, gps_epoch) for url in NODE_TIME_SYNC_URLS]
+                flight_log.append("time_sync", {
+                    "target": "nodes",
+                    "source": "gc_gps",
+                    "epoch": gps_epoch,
+                    "results": node_results,
+                })
+                last_node_time_sync = now
             try:
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:

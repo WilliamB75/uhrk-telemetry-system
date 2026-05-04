@@ -2,20 +2,12 @@
 gps_reader.py
 =================
 
-This module provides a small helper class for reading NMEA sentences
-from the BerryGPS‑IMU HAT attached to the Raspberry Pi Zero 2 W.
-It uses PySerial to read from ``/dev/serial0`` and `pynmea2` to parse
-sentences. The reading happens in a background thread so that calls
-to :meth:`GPSReader.read` return the most recent fix without
-blocking the main loop. If parsing fails or no fix is present the
-last known good values are reused.
+Background NMEA reader for the BerryGPS-IMU HAT.
 
-Fields exposed by :class:`GPSData` include decimal latitude,
-decimal longitude, altitude in metres, a simple fix status code and
-the number of satellites in view.
-
-Use :class:`GPSReader.close` to stop the background thread when
-shutting down.
+The node keeps separate satellite counts for satellites used in the
+navigation solution and satellites merely visible in GSV messages. That
+distinction matters: seeing ten satellites is not the same as having ten
+satellites in the fix.
 """
 
 from __future__ import annotations
@@ -24,42 +16,32 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-import serial  # type: ignore
 import pynmea2  # type: ignore
+import serial  # type: ignore
 
 
 @dataclass
 class GPSData:
-    """Container for a single GPS fix.
-
-    :param lat: Latitude in decimal degrees.
-    :param lon: Longitude in decimal degrees.
-    :param alt_m: Altitude above mean sea level in metres.
-    :param status: Fix status code (0 = no fix, 1 = 2D fix, 2 = 3D fix).
-    :param sats: Number of satellites used in the fix.
-    """
+    """Container for the latest GPS state."""
 
     lat: float
     lon: float
     alt_m: float
     status: int
     sats: int
+    sats_used: int = 0
+    sats_in_view: int = 0
+    hdop: float | None = None
+    pdop: float | None = None
+    vdop: float | None = None
 
 
 class GPSReader:
-    """Continuously reads NMEA sentences from a serial port and exposes the most recent fix.
-
-    The reader spawns a background thread on instantiation to avoid blocking
-    the caller. It keeps the most recent :class:`GPSData` in a thread safe
-    variable. On any parse error or communications fault the previous
-    good fix is retained so that the main telemetry loop can continue
-    transmitting.
-    """
+    """Continuously read NMEA sentences from a serial port."""
 
     def __init__(self, port: str = "/dev/serial0", baudrate: int = 9600, timeout: float = 1.0) -> None:
         self.ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
         self._lock = threading.Lock()
-        # Start with a sensible default: zeroed position and no fix
         self._latest: GPSData = GPSData(lat=0.0, lon=0.0, alt_m=0.0, status=0, sats=0)
         self._fix_dimension = 1
         self._stop = False
@@ -69,83 +51,86 @@ class GPSReader:
     def _status_for_valid_position(self) -> int:
         return 2 if self._fix_dimension >= 3 else 1
 
+    def _latest_with(self, **updates: object) -> GPSData:
+        data = {
+            "lat": self._latest.lat,
+            "lon": self._latest.lon,
+            "alt_m": self._latest.alt_m,
+            "status": self._latest.status,
+            "sats": self._latest.sats,
+            "sats_used": self._latest.sats_used,
+            "sats_in_view": self._latest.sats_in_view,
+            "hdop": self._latest.hdop,
+            "pdop": self._latest.pdop,
+            "vdop": self._latest.vdop,
+        }
+        data.update(updates)
+        data["sats"] = data.get("sats_used") or data.get("sats") or 0
+        return GPSData(**data)  # type: ignore[arg-type]
+
+    def _float_attr(self, msg: object, attr: str, fallback: float | None = None) -> float | None:
+        value = getattr(msg, attr, None)
+        try:
+            return float(value) if value not in (None, "") else fallback
+        except (TypeError, ValueError):
+            return fallback
+
     def _parse_sentence(self, line: str) -> Optional[GPSData]:
-        """Parse a single NMEA sentence and return a :class:`GPSData` if it
-        contains position information. Returns ``None`` if the sentence
-        doesn't convey position or if parsing fails.
-        """
         try:
             msg = pynmea2.parse(line)
         except pynmea2.ParseError:
             return None
-        # We care about sentences carrying lat/lon (GGA, RMC) and altitude (GGA)
+
         if isinstance(msg, pynmea2.types.talker.GGA):  # type: ignore[attr-defined]
-            lat = msg.latitude
-            lon = msg.longitude
-            alt = float(msg.altitude) if getattr(msg, "altitude", None) is not None else self._latest.alt_m
             sats_used = int(getattr(msg, "num_sats", 0) or 0)
-            # gps_qual indicates fix quality (0 = invalid, 1 = GPS, 2 = DGPS, 6 = estimated)
             fix_quality = int(getattr(msg, "gps_qual", 0) or 0)
-            sats = sats_used if fix_quality > 0 or sats_used > 0 else self._latest.sats
-            if fix_quality == 0:
-                status = 0
-            else:
-                status = self._status_for_valid_position()
-            return GPSData(lat=lat, lon=lon, alt_m=alt, status=status, sats=sats)
-        elif isinstance(msg, pynmea2.types.talker.RMC):  # type: ignore[attr-defined]
-            # RMC lacks altitude so reuse the last known altitude
-            if getattr(msg, "status", "V") != "A":
-                # 'A' indicates data valid
-                status = 0
-            else:
-                status = self._status_for_valid_position()
-            lat = msg.latitude
-            lon = msg.longitude
-            # Altitude and satellites count remain unchanged
-            alt = self._latest.alt_m
-            sats = self._latest.sats
-            return GPSData(lat=lat, lon=lon, alt_m=alt, status=status, sats=sats)
-        elif getattr(msg, "sentence_type", "") == "GSA":
+            status = 0 if fix_quality == 0 else self._status_for_valid_position()
+            alt = self._float_attr(msg, "altitude", self._latest.alt_m)
+            hdop = self._float_attr(msg, "horizontal_dil", self._latest.hdop)
+            return self._latest_with(
+                lat=msg.latitude,
+                lon=msg.longitude,
+                alt_m=alt if alt is not None else self._latest.alt_m,
+                status=status,
+                sats=sats_used,
+                sats_used=sats_used,
+                hdop=hdop,
+            )
+
+        if isinstance(msg, pynmea2.types.talker.RMC):  # type: ignore[attr-defined]
+            status = 0 if getattr(msg, "status", "V") != "A" else self._status_for_valid_position()
+            return self._latest_with(lat=msg.latitude, lon=msg.longitude, status=status)
+
+        if getattr(msg, "sentence_type", "") == "GSA":
             try:
                 self._fix_dimension = int(getattr(msg, "mode_fix_type", self._fix_dimension) or self._fix_dimension)
             except (TypeError, ValueError):
                 pass
+            updates: dict[str, object] = {}
+            for attr in ("pdop", "hdop", "vdop"):
+                value = self._float_attr(msg, attr, getattr(self._latest, attr))
+                if value is not None:
+                    updates[attr] = value
             if self._latest.status > 0:
-                return GPSData(
-                    lat=self._latest.lat,
-                    lon=self._latest.lon,
-                    alt_m=self._latest.alt_m,
-                    status=self._status_for_valid_position(),
-                    sats=self._latest.sats,
-                )
-            return None
-        elif getattr(msg, "sentence_type", "") == "GSV":
-            # GSV reports satellites in view even before they are used in a fix.
+                updates["status"] = self._status_for_valid_position()
+            return self._latest_with(**updates) if updates else None
+
+        if getattr(msg, "sentence_type", "") == "GSV":
             try:
-                sats = int(getattr(msg, "num_sv_in_view", self._latest.sats) or self._latest.sats)
+                sats_in_view = int(getattr(msg, "num_sv_in_view", self._latest.sats_in_view) or self._latest.sats_in_view)
             except (TypeError, ValueError):
-                sats = self._latest.sats
-            return GPSData(
-                lat=self._latest.lat,
-                lon=self._latest.lon,
-                alt_m=self._latest.alt_m,
-                status=self._latest.status,
-                sats=sats,
-            )
-        else:
-            return None
+                sats_in_view = self._latest.sats_in_view
+            return self._latest_with(sats_in_view=sats_in_view)
+
+        return None
 
     def _read_loop(self) -> None:
-        """Background thread that continuously reads from the serial port."""
         while not self._stop:
             try:
                 line_bytes = self.ser.readline()
                 if not line_bytes:
                     continue
-                try:
-                    line = line_bytes.decode("ascii", errors="ignore").strip()
-                except UnicodeDecodeError:
-                    continue
+                line = line_bytes.decode("ascii", errors="ignore").strip()
                 if not line.startswith("$"):
                     continue
                 data = self._parse_sentence(line)
@@ -153,20 +138,13 @@ class GPSReader:
                     with self._lock:
                         self._latest = data
             except Exception:
-                # Ignore all errors; keep previous fix
                 continue
 
     def read(self) -> GPSData:
-        """Return the most recent GPS fix.
-
-        This call never blocks and will always return a :class:`GPSData`
-        even if no new fix has arrived since the previous call.
-        """
         with self._lock:
             return self._latest
 
     def close(self) -> None:
-        """Signal the background thread to stop and close the serial port."""
         self._stop = True
         try:
             self._thread.join(timeout=1.0)

@@ -14,6 +14,7 @@
   const SETTINGS_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/settings';
   const PAD_STATE_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/pad-state';
   const ALTITUDE_ZERO_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/altitude-zero';
+  const TIME_SYNC_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/time-sync';
   const THEME_KEY = 'uhrk-dashboard-theme';
   const GRAVITY_REFERENCE = 9.80665;
   const LINEAR_ACCEL_DEADBAND = 0.25;
@@ -37,7 +38,10 @@
       linearAccelDeadbandMps2: 0.25,
       velocitySmoothingAlpha: 0.22,
       altitudeNoiseDeadbandM: 0.35,
-      stationaryVelocityDeadbandMps: 0.35
+      stationaryVelocityDeadbandMps: 0.35,
+      maxBaroStepM: 25.0,
+      maxGpsStepM: 35.0,
+      maxGpsAltStepM: 30.0
     },
     events: [
       { id: 'launch', label: 'Launch detect', stage: 'All', accelAboveG: 2.5, minDurationMs: 120 },
@@ -143,6 +147,15 @@
 
   function signalQuality(data) {
     return fmt(data.rssi, 0, ' dBm') + ' | ' + fmt(data.snr, 1, ' dB');
+  }
+
+  function satelliteSummary(data) {
+    const used = data.satsUsed ?? null;
+    const view = data.satsInView ?? data.sats ?? null;
+    if (used == null && view == null) return '-';
+    if (used == null) return '- | ' + view;
+    if (view == null) return used + ' | -';
+    return used + ' | ' + view;
   }
 
   function readinessText(data) {
@@ -404,7 +417,7 @@
       '<dl class="metric-grid compact">',
       '<div><dt>Seq</dt><dd>' + fmtRaw(data.seq) + '</dd></div>',
       '<div><dt>GPS</dt><dd>' + fmtRaw(data.gpsStatus) + '</dd></div>',
-      '<div><dt>Sats view/fix</dt><dd>' + fmtRaw(data.sats) + '</dd></div>',
+      '<div><dt>Sats used | view</dt><dd>' + satelliteSummary(data) + '</dd></div>',
       '<div><dt>Rel altitude</dt><dd>' + fmt(data.fusedRelAlt ?? data.fusedAlt, 1, ' m') + '</dd></div>',
       '<div><dt>Velocity</dt><dd>' + fmt(data.verticalVelocity, 2, ' m/s') + '</dd></div>',
       '<div><dt>IMU velocity</dt><dd>' + fmt(data.imuVelocity, 2, ' m/s') + '</dd></div>',
@@ -445,7 +458,8 @@
       detailRow('Last seen', data.lastSeenMs != null ? fmt(data.lastSeenMs / 1000, 1, ' s ago') : '-'),
       detailRow('Last update UTC', fmtRaw(data.lastUpdateUtc)),
       detailRow('GPS status', fmtRaw(data.gpsStatus)),
-      detailRow('Satellites view/fix', fmtRaw(data.sats)),
+      detailRow('Satellites used | view', satelliteSummary(data)),
+      detailRow('GPS quality', fmtRaw(data.gpsQuality)),
       detailRow('Position', fmtPosition(data.lat, data.lon)),
       detailRow('Readiness', readinessText(data)),
       detailRow('Pad zero', zeroText(data)),
@@ -638,7 +652,10 @@
       settingsInput('sensor.linearAccelDeadbandMps2', 'Stationary accel deadband (m/s^2)', sensor.linearAccelDeadbandMps2 ?? LINEAR_ACCEL_DEADBAND, '0.01'),
       settingsInput('sensor.velocitySmoothingAlpha', 'Velocity smoothing alpha', sensor.velocitySmoothingAlpha ?? 0.22, '0.01'),
       settingsInput('sensor.altitudeNoiseDeadbandM', 'Altitude noise deadband (m)', sensor.altitudeNoiseDeadbandM ?? 0.35, '0.01'),
-      settingsInput('sensor.stationaryVelocityDeadbandMps', 'Stationary velocity deadband (m/s)', sensor.stationaryVelocityDeadbandMps ?? 0.35, '0.01')
+      settingsInput('sensor.stationaryVelocityDeadbandMps', 'Stationary velocity deadband (m/s)', sensor.stationaryVelocityDeadbandMps ?? 0.35, '0.01'),
+      settingsInput('sensor.maxBaroStepM', 'Max baro step (m)', sensor.maxBaroStepM ?? 25.0, '1'),
+      settingsInput('sensor.maxGpsStepM', 'Max GPS step (m)', sensor.maxGpsStepM ?? 35.0, '1'),
+      settingsInput('sensor.maxGpsAltStepM', 'Max GPS altitude step (m)', sensor.maxGpsAltStepM ?? 30.0, '1')
     ].join('');
     const eventFields = events.map((event, index) => {
       const numericFields = Object.keys(event)
@@ -677,6 +694,12 @@
         '</div>' +
         '<p id="altitude-zero-status" class="settings-status">Checking altitude zero...</p>' +
       '</section>',
+      '<section class="settings-section"><h3>Clock sync</h3>' +
+        '<div class="pad-state-controls">' +
+          '<button type="button" data-time-sync="browser">Sync from browser</button>' +
+        '</div>' +
+        '<p id="time-sync-status" class="settings-status">GPS time is used automatically when available.</p>' +
+      '</section>',
       '<section class="settings-section"><h3>Sensor processing</h3><div class="settings-grid">' + sensorFields + '</div></section>',
       '<section class="settings-section"><h3>Flight events</h3><div class="settings-card-grid">' + eventFields + '</div></section>',
       '<section class="settings-section"><h3>Recovery chutes</h3><div class="settings-card-grid">' + chuteFields + '</div></section>'
@@ -689,6 +712,11 @@
     settingsContentEl.querySelectorAll('[data-alt-zero-action]').forEach((button) => {
       button.addEventListener('click', async () => {
         await setAltitudeZero(button.dataset.altZeroAction);
+      });
+    });
+    settingsContentEl.querySelectorAll('[data-time-sync]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        await syncTimeFromBrowser();
       });
     });
     refreshPadState();
@@ -741,6 +769,10 @@
 
   function altitudeZeroStatusEl() {
     return document.getElementById('altitude-zero-status');
+  }
+
+  function timeSyncStatusEl() {
+    return document.getElementById('time-sync-status');
   }
 
   function summarizePadState(result) {
@@ -805,6 +837,28 @@
       await fetchTelemetry();
     } catch (err) {
       if (el) el.textContent = 'Altitude zero failed: ' + err.message;
+    }
+  }
+
+  async function syncTimeFromBrowser() {
+    const el = timeSyncStatusEl();
+    if (el) el.textContent = 'Syncing GC and nodes from browser clock...';
+    try {
+      const res = await fetch(TIME_SYNC_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          epoch: Date.now() / 1000,
+          utc: new Date().toISOString(),
+          source: 'browser'
+        })
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) throw new Error(json.error || 'time sync failed');
+      const nodeOk = Array.isArray(json.nodes) ? json.nodes.filter((node) => node.ok).length : 0;
+      if (el) el.textContent = 'Synced ' + json.utc + ' | nodes: ' + nodeOk + '/' + (json.nodes || []).length;
+    } catch (err) {
+      if (el) el.textContent = 'Time sync failed: ' + err.message;
     }
   }
 

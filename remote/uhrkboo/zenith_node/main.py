@@ -177,6 +177,29 @@ def run_shutdown_after_delay(delay_s: float) -> None:
     threading.Thread(target=worker, daemon=True).start()
 
 
+def set_system_time(epoch: float) -> dict[str, object]:
+    if epoch < 1700000000 or epoch > 2200000000:
+        return {"ok": False, "error": "epoch outside expected range"}
+    for command in (
+        ["sudo", "/usr/bin/date", "-u", "-s", f"@{epoch:.3f}"],
+        ["sudo", "/bin/date", "-u", "-s", f"@{epoch:.3f}"],
+    ):
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_error = str(exc)
+            continue
+        if result.returncode == 0:
+            return {
+                "ok": True,
+                "epoch": epoch,
+                "systemUtc": datetime.now(timezone.utc).isoformat(),
+                "stdout": result.stdout.strip(),
+            }
+        last_error = result.stderr.strip() or result.stdout.strip() or f"date exited {result.returncode}"
+    return {"ok": False, "error": last_error}
+
+
 def start_control_server(stop_event: threading.Event, flight_log: FlightLogger, pad_state: PadState) -> ThreadingHTTPServer:
     class ControlHandler(BaseHTTPRequestHandler):
         server_version = "UHRKNodeControl/1.0"
@@ -202,6 +225,14 @@ def start_control_server(stop_event: threading.Event, flight_log: FlightLogger, 
             path = self.path.split("?", 1)[0]
             if path == "/api/pad-state":
                 self._send_json(200, {"ok": True, "padState": pad_state.snapshot()})
+                return
+            if path == "/api/time-sync/status":
+                self._send_json(200, {
+                    "ok": True,
+                    "hostname": socket.gethostname(),
+                    "systemUtc": datetime.now(timezone.utc).isoformat(),
+                    "logPath": str(flight_log.path),
+                })
                 return
             if path != "/api/shutdown/status":
                 self._send_json(404, {"ok": False, "error": "not found"})
@@ -229,6 +260,28 @@ def start_control_server(stop_event: threading.Event, flight_log: FlightLogger, 
                 response = {"ok": True, "hostname": socket.gethostname(), "padState": pad_state.snapshot()}
                 flight_log.append("pad_state", {"remote": self.client_address[0], "mode": current_mode})
                 self._send_json(200, response)
+                return
+            if path == "/api/time-sync":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                try:
+                    payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                    epoch = float(payload.get("epoch"))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    self._send_json(400, {"ok": False, "error": "valid epoch required"})
+                    return
+                before = datetime.now(timezone.utc).isoformat()
+                result = set_system_time(epoch)
+                result.update({
+                    "hostname": socket.gethostname(),
+                    "beforeUtc": before,
+                    "source": payload.get("source") or "gc",
+                })
+                flight_log.append("time_sync", {
+                    "remote": self.client_address[0],
+                    "request": payload,
+                    "result": result,
+                })
+                self._send_json(200 if result.get("ok") else 500, result)
                 return
             if path != "/api/shutdown":
                 self._send_json(404, {"ok": False, "error": "not found"})
@@ -303,7 +356,8 @@ def main() -> None:
             gps_data = gps_reader.read()
             imu_data = imu_reader.read()
             # Derive events
-            flight_flags = event_detector.update(gps_data, imu_data)
+            current_pad_state = pad_state.snapshot()
+            flight_flags = event_detector.update(gps_data, imu_data, bool(current_pad_state["onPadLaunchReady"]))
             flags = current_event_flags(flight_flags, pad_state.flags())
             # Pack payload
             payload = pack_payload(
@@ -315,7 +369,8 @@ def main() -> None:
                 baro_alt_m=imu_data.baro_alt_m,
                 imu_alt_m=imu_data.imu_alt_m,
                 gps_status=gps_data.status,
-                sats=gps_data.sats,
+                sats=gps_data.sats_used,
+                sats_in_view=gps_data.sats_in_view,
                 ax=imu_data.ax,
                 ay=imu_data.ay,
                 az=imu_data.az,
@@ -337,6 +392,11 @@ def main() -> None:
                 "imuAltM": imu_data.imu_alt_m,
                 "gpsStatus": gps_data.status,
                 "sats": gps_data.sats,
+                "satsUsed": gps_data.sats_used,
+                "satsInView": gps_data.sats_in_view,
+                "gpsHdop": gps_data.hdop,
+                "gpsPdop": gps_data.pdop,
+                "gpsVdop": gps_data.vdop,
                 "ax": imu_data.ax,
                 "ay": imu_data.ay,
                 "az": imu_data.az,
@@ -344,13 +404,12 @@ def main() -> None:
                 "gy": imu_data.gy,
                 "gz": imu_data.gz,
                 "eventFlags": flags,
-                "padState": pad_state.snapshot(),
+                "padState": current_pad_state,
                 "payloadBase64": base64.b64encode(payload).decode("ascii"),
             })
             # Advance sequence counter (wrap at 16 bits)
             seq = (seq + 1) & 0xFFFF
             # Listen for GC commands over LoRa until the next telemetry slot.
-            current_pad_state = pad_state.snapshot()
             if current_pad_state["onPadLaunchReady"]:
                 cadence = cfg.LAUNCH_READY_CADENCE_SECONDS + cfg.DEVICE_ID * cfg.LAUNCH_READY_DEVICE_SLOT_SECONDS
             else:

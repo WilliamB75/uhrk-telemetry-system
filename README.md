@@ -1,6 +1,6 @@
-# UHRK Telemetry Project
+# UHRK Telemetry System
 
-Ground-station and node-side code for the UHRK rocket telemetry setup.
+Ground-station dashboard and LoRa telemetry node software for UHRK rocket flight testing.
 
 ## Project Layout
 
@@ -14,8 +14,8 @@ Ground-station and node-side code for the UHRK rocket telemetry setup.
 Clone the repository, then open the cloned folder in Codex:
 
 ```powershell
-git clone https://github.com/WilliamB75/M26-Testy-Test.git
-cd M26-Testy-Test
+git clone https://github.com/WilliamB75/uhrk-telemetry-system.git
+cd uhrk-telemetry-system
 ```
 
 Pi passwords, private keys, and live flight logs are intentionally not stored in

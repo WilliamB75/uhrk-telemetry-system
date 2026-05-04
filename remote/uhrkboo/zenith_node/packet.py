@@ -20,7 +20,7 @@ The packet layout (big‑endian)::
     | 15          | i32   | baro_alt_m (metres * 100)   |
     | 19          | i32   | imu_alt_m (metres * 100)    |
     | 23          | u8    | gps_status                  |
-    | 24          | u8    | sats                        |
+    | 24          | u8    | sats used/view nibbles      |
     | 25          | i16   | ax (m/s² * 10)              |
     | 27          | i16   | ay (m/s² * 10)              |
     | 29          | i16   | az (m/s² * 10)              |
@@ -44,6 +44,30 @@ from .config import Config
 
 # Precompile the struct for the packet format. '>' denotes big‑endian.
 _PACKET_STRUCT = struct.Struct('>B H i i i i i B B h h h h h h H')
+
+
+def encode_satellite_counts(sats_used: int, sats_in_view: int | None = None) -> int:
+    """Pack sats-in-view and sats-used into one byte.
+
+    Upper nibble: satellites in view. Lower nibble: satellites used in the fix.
+    Values are capped at 15, which is enough for the compact dashboard signal
+    while keeping the LoRa packet length unchanged.
+    """
+    used = max(0, min(15, int(sats_used or 0)))
+    view = max(0, min(15, int(sats_in_view if sats_in_view is not None else used)))
+    return (view << 4) | used
+
+
+def decode_satellite_counts(encoded: int, gps_status: int = 0) -> tuple[int, int]:
+    """Decode the compact satellite count byte.
+
+    Legacy packets used the whole byte as a single count. Treat values <= 15 as
+    legacy and infer used satellites only when the packet has a fix.
+    """
+    raw = int(encoded or 0) & 0xFF
+    if raw <= 15:
+        return (raw if gps_status > 0 else 0), raw
+    return raw & 0x0F, (raw >> 4) & 0x0F
 
 
 def _clamp_int16(value: float) -> int:
@@ -77,6 +101,7 @@ def pack_payload(
     imu_alt_m: float,
     gps_status: int,
     sats: int,
+    sats_in_view: int,
     ax: float,
     ay: float,
     az: float,
@@ -113,7 +138,7 @@ def pack_payload(
         baro_alt_i,
         imu_alt_i,
         gps_status & 0xFF,
-        sats & 0xFF,
+        encode_satellite_counts(sats, sats_in_view),
         ax_i,
         ay_i,
         az_i,
@@ -142,7 +167,7 @@ def unpack_payload(payload: bytes, config: Config = Config()) -> Dict[str, Any]:
         baro_alt_i,
         imu_alt_i,
         gps_status,
-        sats,
+        sats_encoded,
         ax_i,
         ay_i,
         az_i,
@@ -161,7 +186,9 @@ def unpack_payload(payload: bytes, config: Config = Config()) -> Dict[str, Any]:
         "baro_alt_m": baro_alt_i / config.ALT_SCALE,
         "imu_alt_m": imu_alt_i / config.ALT_SCALE,
         "gps_status": gps_status,
-        "sats": sats,
+        "sats": sats_encoded,
+        "sats_used": decode_satellite_counts(sats_encoded, gps_status)[0],
+        "sats_in_view": decode_satellite_counts(sats_encoded, gps_status)[1],
         "ax": ax_i / config.ACC_SCALE,
         "ay": ay_i / config.ACC_SCALE,
         "az": az_i / config.ACC_SCALE,
