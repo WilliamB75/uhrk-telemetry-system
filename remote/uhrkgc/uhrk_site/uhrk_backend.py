@@ -65,6 +65,11 @@ STATIONARY_VELOCITY_DEADBAND_MPS = float(os.environ.get("UHRK_STATIONARY_VELOCIT
 MAX_BARO_STEP_M = float(os.environ.get("UHRK_MAX_BARO_STEP_M", "25.0"))
 MAX_GPS_STEP_M = float(os.environ.get("UHRK_MAX_GPS_STEP_M", "35.0"))
 MAX_GPS_ALT_STEP_M = float(os.environ.get("UHRK_MAX_GPS_ALT_STEP_M", "30.0"))
+KALMAN_BARO_VARIANCE_M2 = float(os.environ.get("UHRK_KALMAN_BARO_VARIANCE_M2", "2.25"))
+KALMAN_ACCEL_VARIANCE_MPS2 = float(os.environ.get("UHRK_KALMAN_ACCEL_VARIANCE_MPS2", "4.0"))
+KALMAN_PROCESS_ALTITUDE = float(os.environ.get("UHRK_KALMAN_PROCESS_ALTITUDE", "0.08"))
+KALMAN_PROCESS_VELOCITY = float(os.environ.get("UHRK_KALMAN_PROCESS_VELOCITY", "1.0"))
+KALMAN_PROCESS_ACCEL = float(os.environ.get("UHRK_KALMAN_PROCESS_ACCEL", "4.0"))
 
 PUSH_DATA = 0x00
 PUSH_ACK = 0x01
@@ -157,6 +162,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "maxBaroStepM": MAX_BARO_STEP_M,
         "maxGpsStepM": MAX_GPS_STEP_M,
         "maxGpsAltStepM": MAX_GPS_ALT_STEP_M,
+        "kalmanBaroVarianceM2": KALMAN_BARO_VARIANCE_M2,
+        "kalmanAccelVarianceMps2": KALMAN_ACCEL_VARIANCE_MPS2,
+        "kalmanProcessAltitude": KALMAN_PROCESS_ALTITUDE,
+        "kalmanProcessVelocity": KALMAN_PROCESS_VELOCITY,
+        "kalmanProcessAccel": KALMAN_PROCESS_ACCEL,
     },
     "events": [
         {"id": "launch", "label": "Launch detect", "stage": "All", "accelAboveG": 2.5, "minDurationMs": 120},
@@ -399,6 +409,11 @@ class StageState:
     imuVelocity: Optional[float] = None
     accelMagnitude: Optional[float] = None
     linearAccel: Optional[float] = None
+    rawLinearAccel: Optional[float] = None
+    kalmanAlt: Optional[float] = None
+    kalmanRelAlt: Optional[float] = None
+    kalmanVelocity: Optional[float] = None
+    kalmanAccel: Optional[float] = None
     gpsStatus: Optional[str] = None
     sats: Optional[int] = None
     satsUsed: Optional[int] = None
@@ -429,6 +444,8 @@ class StageState:
     _accepted_lon: Optional[float] = None
     _last_rejection: Optional[str] = None
     _last_gps_rejection: Optional[str] = None
+    _kalman_x: Optional[List[float]] = None
+    _kalman_p: Optional[List[List[float]]] = None
 
     def apply_altitude_zero(self, zero: Dict[str, Any]) -> None:
         self.altitudeZero = {
@@ -452,7 +469,9 @@ class StageState:
         self.baroRelAlt = self._relative_altitude("baroAlt", self.baroAlt)
         self.imuRelAlt = self._relative_altitude("imuAlt", self.imuAlt)
         self.fusedRelAlt = self._relative_altitude("fusedAlt", self.fusedAlt)
+        self.kalmanRelAlt = self._relative_altitude("fusedAlt", self.kalmanAlt)
         self.verticalVelocity = 0.0
+        self.kalmanVelocity = 0.0
         self.imuVelocity = 0.0
         self.history = []
         return zero
@@ -463,7 +482,9 @@ class StageState:
         self.baroRelAlt = self.baroAlt
         self.imuRelAlt = self.imuAlt
         self.fusedRelAlt = self.fusedAlt
+        self.kalmanRelAlt = self.kalmanAlt
         self.verticalVelocity = 0.0
+        self.kalmanVelocity = 0.0
         self.imuVelocity = 0.0
         self.history = []
 
@@ -501,6 +522,84 @@ class StageState:
         self._last_gps_rejection = None
         return True
 
+    def _reset_vertical_kalman(self, altitude_m: float, acceleration_mps2: float, baro_variance: float, accel_variance: float) -> None:
+        self._kalman_x = [altitude_m, 0.0, acceleration_mps2]
+        self._kalman_p = [
+            [max(0.001, baro_variance), 0.0, 0.0],
+            [0.0, 4.0, 0.0],
+            [0.0, 0.0, max(0.001, accel_variance)],
+        ]
+
+    def _kalman_update_scalar(self, measurement: float, h: List[float], variance: float) -> None:
+        if self._kalman_x is None or self._kalman_p is None:
+            return
+        p = self._kalman_p
+        ph = [sum(p[row][col] * h[col] for col in range(3)) for row in range(3)]
+        innovation_variance = sum(h[row] * ph[row] for row in range(3)) + max(0.001, variance)
+        if innovation_variance <= 0:
+            return
+        innovation = measurement - sum(h[row] * self._kalman_x[row] for row in range(3))
+        gain = [value / innovation_variance for value in ph]
+        self._kalman_x = [self._kalman_x[row] + gain[row] * innovation for row in range(3)]
+        hp = [sum(h[row] * p[row][col] for row in range(3)) for col in range(3)]
+        next_p = [
+            [p[row][col] - gain[row] * hp[col] for col in range(3)]
+            for row in range(3)
+        ]
+        self._kalman_p = [
+            [(next_p[row][col] + next_p[col][row]) * 0.5 for col in range(3)]
+            for row in range(3)
+        ]
+
+    def _run_vertical_kalman(
+        self,
+        altitude_m: float,
+        acceleration_mps2: float,
+        dt: Optional[float],
+        baro_variance: float,
+        accel_variance: float,
+        process_altitude: float,
+        process_velocity: float,
+        process_accel: float,
+    ) -> None:
+        if self._kalman_x is None or self._kalman_p is None or dt is None or dt > 5.0:
+            self._reset_vertical_kalman(altitude_m, acceleration_mps2, baro_variance, accel_variance)
+        else:
+            dt = max(0.001, min(2.5, dt))
+            x = self._kalman_x
+            p = self._kalman_p
+            transition = [
+                [1.0, dt, 0.5 * dt * dt],
+                [0.0, 1.0, dt],
+                [0.0, 0.0, 1.0],
+            ]
+            predicted_x = [
+                x[0] + x[1] * dt + 0.5 * x[2] * dt * dt,
+                x[1] + x[2] * dt,
+                x[2],
+            ]
+            fp = [
+                [sum(transition[row][k] * p[k][col] for k in range(3)) for col in range(3)]
+                for row in range(3)
+            ]
+            predicted_p = [
+                [sum(fp[row][k] * transition[col][k] for k in range(3)) for col in range(3)]
+                for row in range(3)
+            ]
+            predicted_p[0][0] += max(0.0, process_altitude) * dt
+            predicted_p[1][1] += max(0.0, process_velocity) * dt
+            predicted_p[2][2] += max(0.0, process_accel) * dt
+            self._kalman_x = predicted_x
+            self._kalman_p = predicted_p
+
+        self._kalman_update_scalar(acceleration_mps2, [0.0, 0.0, 1.0], accel_variance)
+        self._kalman_update_scalar(altitude_m, [1.0, 0.0, 0.0], baro_variance)
+        if self._kalman_x is None:
+            return
+        self.kalmanAlt = self._kalman_x[0]
+        self.kalmanVelocity = self._kalman_x[1]
+        self.kalmanAccel = self._kalman_x[2]
+
     def _update_readiness(self, now: float) -> None:
         gps_ready = self.gpsStatus == "3D fix" and (self.satsUsed or 0) >= 4
         link_ready = self.rssi is not None and self.snr is not None and self.snr > -5
@@ -527,6 +626,11 @@ class StageState:
         max_baro_step_m = max(0.0, sensor_float("maxBaroStepM", MAX_BARO_STEP_M))
         max_gps_step_m = max(0.0, sensor_float("maxGpsStepM", MAX_GPS_STEP_M))
         max_gps_alt_step_m = max(0.0, sensor_float("maxGpsAltStepM", MAX_GPS_ALT_STEP_M))
+        kalman_baro_variance = max(0.001, sensor_float("kalmanBaroVarianceM2", KALMAN_BARO_VARIANCE_M2))
+        kalman_accel_variance = max(0.001, sensor_float("kalmanAccelVarianceMps2", KALMAN_ACCEL_VARIANCE_MPS2))
+        kalman_process_altitude = max(0.0, sensor_float("kalmanProcessAltitude", KALMAN_PROCESS_ALTITUDE))
+        kalman_process_velocity = max(0.0, sensor_float("kalmanProcessVelocity", KALMAN_PROCESS_VELOCITY))
+        kalman_process_accel = max(0.0, sensor_float("kalmanProcessAccel", KALMAN_PROCESS_ACCEL))
         self.seq = int(decoded["seq"])
         self._last_rejection = None
         self._last_gps_rejection = None
@@ -553,42 +657,57 @@ class StageState:
             self.gpsStatus = "3D fix"
         else:
             self.gpsStatus = f"Unknown ({gps_status_code})"
-        # Keep IMU altitude visible, but exclude it from fused altitude for now.
-        # The accelerometer frame is not yet aligned/calibrated well enough for
-        # double-integrated altitude to improve the live flight estimate.
-        self.fusedAlt = self.baroAlt
-        self.gpsRelAlt = self._relative_altitude("gpsAlt", self.gpsAlt)
-        self.baroRelAlt = self._relative_altitude("baroAlt", self.baroAlt)
-        self.imuRelAlt = self._relative_altitude("imuAlt", self.imuAlt)
-        self.fusedRelAlt = self._relative_altitude("fusedAlt", self.fusedAlt)
         self.ax = float(decoded["ax"])
         self.ay = float(decoded["ay"])
         self.az = float(decoded["az"])
         self.accelMagnitude = math.sqrt(self.ax * self.ax + self.ay * self.ay + self.az * self.az)
-        self.linearAccel = self.accelMagnitude - gravity_reference
-        if abs(self.linearAccel) < linear_accel_deadband:
+        self.rawLinearAccel = self.accelMagnitude - gravity_reference
+        accel_measurement = self.rawLinearAccel
+        if abs(accel_measurement) < linear_accel_deadband:
+            accel_measurement = 0.0
+        dt = now - previous_update_mono if previous_update_mono > 0 and now > previous_update_mono else None
+        self._run_vertical_kalman(
+            self.baroAlt,
+            accel_measurement,
+            dt,
+            kalman_baro_variance,
+            kalman_accel_variance,
+            kalman_process_altitude,
+            kalman_process_velocity,
+            kalman_process_accel,
+        )
+        # GPS stays out of the vertical estimator. The fused altitude is now the
+        # baro-plus-IMU Kalman altitude; GPS altitude remains a separate display.
+        self.fusedAlt = self.kalmanAlt if self.kalmanAlt is not None else self.baroAlt
+        self.gpsRelAlt = self._relative_altitude("gpsAlt", self.gpsAlt)
+        self.baroRelAlt = self._relative_altitude("baroAlt", self.baroAlt)
+        self.imuRelAlt = self._relative_altitude("imuAlt", self.imuAlt)
+        self.fusedRelAlt = self._relative_altitude("fusedAlt", self.fusedAlt)
+        self.kalmanRelAlt = self.fusedRelAlt
+        self.verticalVelocity = self.kalmanVelocity
+        self.linearAccel = self.kalmanAccel
+        if self.linearAccel is not None and abs(self.linearAccel) < linear_accel_deadband:
             self.linearAccel = 0.0
-        if previous_fused_alt is not None and self.fusedRelAlt is not None and previous_update_mono > 0 and now > previous_update_mono:
+            self.kalmanAccel = 0.0
+        stationary_candidate = False
+        if previous_fused_alt is not None and self.fusedRelAlt is not None and dt is not None:
             alt_delta = self.fusedRelAlt - previous_fused_alt
-            raw_velocity = 0.0 if abs(alt_delta) < altitude_noise_deadband else alt_delta / (now - previous_update_mono)
-            if self.verticalVelocity is None:
-                self.verticalVelocity = raw_velocity
-            else:
-                self.verticalVelocity += (raw_velocity - self.verticalVelocity) * smoothing_alpha
-            if self.linearAccel == 0.0 and abs(raw_velocity) < stationary_velocity_deadband:
-                self.verticalVelocity *= 0.45
-            if abs(raw_velocity) < stationary_velocity_deadband and abs(self.verticalVelocity) < 0.12:
-                self.verticalVelocity = 0.0
-        else:
-            self.verticalVelocity = None
+            stationary_candidate = accel_measurement == 0.0 and abs(alt_delta) < altitude_noise_deadband
+        if stationary_candidate and self.verticalVelocity is not None and abs(self.verticalVelocity) < stationary_velocity_deadband:
+            self.verticalVelocity = 0.0
+            self.kalmanVelocity = 0.0
+            if self._kalman_x is not None:
+                self._kalman_x[1] = 0.0
+                if self.linearAccel == 0.0:
+                    self._kalman_x[2] = 0.0
         if previous_update_mono > 0 and now > previous_update_mono:
             dt = now - previous_update_mono
             previous_imu_velocity = self.imuVelocity or 0.0
-            raw_imu_velocity = previous_imu_velocity + self.linearAccel * dt
-            if self.linearAccel == 0.0:
+            raw_imu_velocity = previous_imu_velocity + accel_measurement * dt
+            if accel_measurement == 0.0:
                 raw_imu_velocity *= 0.35
             self.imuVelocity = previous_imu_velocity + (raw_imu_velocity - previous_imu_velocity) * smoothing_alpha
-            if self.linearAccel == 0.0 and abs(self.imuVelocity) < 0.08:
+            if accel_measurement == 0.0 and abs(self.imuVelocity) < 0.08:
                 self.imuVelocity = 0.0
         else:
             self.imuVelocity = None
@@ -621,8 +740,13 @@ class StageState:
             "fusedRelAlt": self.fusedRelAlt,
             "verticalVelocity": self.verticalVelocity,
             "imuVelocity": self.imuVelocity,
+            "kalmanAlt": self.kalmanAlt,
+            "kalmanRelAlt": self.kalmanRelAlt,
+            "kalmanVelocity": self.kalmanVelocity,
+            "kalmanAccel": self.kalmanAccel,
             "accelMagnitude": self.accelMagnitude,
             "linearAccel": self.linearAccel,
+            "rawLinearAccel": self.rawLinearAccel,
             "gpsQuality": self.gpsQuality,
             "ax": self.ax,
             "ay": self.ay,
@@ -662,8 +786,13 @@ class StageState:
             "fusedRelAlt": self.fusedRelAlt,
             "verticalVelocity": self.verticalVelocity,
             "imuVelocity": self.imuVelocity,
+            "kalmanAlt": self.kalmanAlt,
+            "kalmanRelAlt": self.kalmanRelAlt,
+            "kalmanVelocity": self.kalmanVelocity,
+            "kalmanAccel": self.kalmanAccel,
             "accelMagnitude": self.accelMagnitude,
             "linearAccel": self.linearAccel,
+            "rawLinearAccel": self.rawLinearAccel,
             "gpsStatus": self.gpsStatus,
             "sats": self.sats,
             "satsUsed": self.satsUsed,

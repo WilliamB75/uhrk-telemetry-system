@@ -41,7 +41,12 @@
       stationaryVelocityDeadbandMps: 0.35,
       maxBaroStepM: 25.0,
       maxGpsStepM: 35.0,
-      maxGpsAltStepM: 30.0
+      maxGpsAltStepM: 30.0,
+      kalmanBaroVarianceM2: 2.25,
+      kalmanAccelVarianceMps2: 4.0,
+      kalmanProcessAltitude: 0.08,
+      kalmanProcessVelocity: 1.0,
+      kalmanProcessAccel: 4.0
     },
     events: [
       { id: 'launch', label: 'Launch detect', stage: 'All', accelAboveG: 2.5, minDurationMs: 120 },
@@ -79,11 +84,16 @@
       fusedRelAlt: [],
       velocity: [],
       imuVelocity: [],
+      kalmanAlt: [],
+      kalmanRelAlt: [],
+      kalmanVelocity: [],
+      kalmanAccel: [],
       ax: [],
       ay: [],
       az: [],
       accelMag: [],
       linearAccel: [],
+      rawLinearAccel: [],
       gx: [],
       gy: [],
       gz: [],
@@ -367,9 +377,9 @@
       accelChart.data.labels = labels;
       gyroChart.data.labels = labels;
       altChart.data.datasets = stages.map((stage, idx) => dataset(stage.name, stage.history.fusedRelAlt, STAGE_COLORS[idx]));
-      velocityChart.data.datasets = stages.map((stage, idx) => dataset(stage.name, stage.history.velocity, STAGE_COLORS[idx]));
+      velocityChart.data.datasets = stages.map((stage, idx) => dataset(stage.name, stage.history.kalmanVelocity, STAGE_COLORS[idx]));
       imuVelocityChart.data.datasets = stages.map((stage, idx) => dataset(stage.name, stage.history.imuVelocity, STAGE_COLORS[idx]));
-      accelChart.data.datasets = stages.map((stage, idx) => dataset(stage.name, stage.history.linearAccel, STAGE_COLORS[idx]));
+      accelChart.data.datasets = stages.map((stage, idx) => dataset(stage.name, stage.history.kalmanAccel, STAGE_COLORS[idx]));
       gyroChart.data.datasets = stages.map((stage, idx) => dataset(stage.name, stage.history.gyroMag, STAGE_COLORS[idx]));
     } else {
       const stage = stages[Number(activeView)];
@@ -380,16 +390,17 @@
       accelChart.data.labels = h.time;
       gyroChart.data.labels = h.time;
       altChart.data.datasets = [
-        dataset('Fused rel', h.fusedRelAlt, cssVar('--alt-fused', '#f8fafc'), false, { borderWidth: 2.4, pointRadius: 1.5 }),
+        dataset('Kalman fused rel', h.fusedRelAlt, cssVar('--alt-fused', '#f8fafc'), false, { borderWidth: 2.4, pointRadius: 1.5 }),
         dataset('GPS rel', h.gpsRelAlt, cssVar('--alt-gps', '#60a5fa'), false, { borderWidth: 1.8, pointRadius: 1.2 }),
         dataset('Baro rel', h.baroRelAlt, cssVar('--alt-baro', '#34d399'), false, { borderWidth: 4, pointRadius: 2.4, order: -1 }),
         dataset('IMU rel', h.imuRelAlt, cssVar('--alt-imu', '#f59e0b'), true, { borderWidth: 1.8, pointRadius: 1.2 }),
         dataset('Fused abs', h.fusedAlt, '#94a3b8', true, { borderWidth: 1.2, pointRadius: 0.8 })
       ];
-      velocityChart.data.datasets = [dataset('Vertical', h.velocity, '#0f766e')];
+      velocityChart.data.datasets = [dataset('Kalman vertical', h.kalmanVelocity, '#0f766e')];
       imuVelocityChart.data.datasets = [dataset('IMU vertical', h.imuVelocity, cssVar('--alt-imu', '#f59e0b'))];
       accelChart.data.datasets = [
-        dataset('Linear |a|-g', h.linearAccel, '#34d399', false, { borderWidth: 3, pointRadius: 2 }),
+        dataset('Kalman linear accel', h.kalmanAccel, '#34d399', false, { borderWidth: 3, pointRadius: 2 }),
+        dataset('Raw |a|-g', h.rawLinearAccel, '#f59e0b', true),
         dataset('Raw |a|', h.accelMag, '#f8fafc', true),
         dataset('ax raw', h.ax, '#be123c', true),
         dataset('ay raw', h.ay, '#94a3b8', true),
@@ -419,9 +430,9 @@
       '<div><dt>GPS</dt><dd>' + fmtRaw(data.gpsStatus) + '</dd></div>',
       '<div><dt>Sats used | view</dt><dd>' + satelliteSummary(data) + '</dd></div>',
       '<div><dt>Rel altitude</dt><dd>' + fmt(data.fusedRelAlt ?? data.fusedAlt, 1, ' m') + '</dd></div>',
-      '<div><dt>Velocity</dt><dd>' + fmt(data.verticalVelocity, 2, ' m/s') + '</dd></div>',
+      '<div><dt>Kalman velocity</dt><dd>' + fmt(data.kalmanVelocity ?? data.verticalVelocity, 2, ' m/s') + '</dd></div>',
       '<div><dt>IMU velocity</dt><dd>' + fmt(data.imuVelocity, 2, ' m/s') + '</dd></div>',
-      '<div><dt>Linear accel</dt><dd>' + fmt(data.linearAccel, 2, ' m/s^2') + '</dd></div>',
+      '<div><dt>Kalman accel</dt><dd>' + fmt(data.kalmanAccel ?? data.linearAccel, 2, ' m/s^2') + '</dd></div>',
       '<div><dt>RSSI | SNR</dt><dd>' + signalQuality(data) + '</dd></div>',
       '<div><dt>Pad zero</dt><dd>' + zeroText(data) + '</dd></div>',
       '<div><dt>Readiness</dt><dd>' + readinessText(data) + '</dd></div>',
@@ -464,15 +475,17 @@
       detailRow('Readiness', readinessText(data)),
       detailRow('Pad zero', zeroText(data)),
       detailRow('Relative fused altitude', fmt(data.fusedRelAlt ?? data.fusedAlt, 1, ' m')),
+      detailRow('Relative Kalman altitude', fmt(data.kalmanRelAlt ?? data.kalmanAlt, 1, ' m')),
       detailRow('Relative GPS altitude', fmt(data.gpsRelAlt ?? data.gpsAlt, 1, ' m')),
       detailRow('Relative baro altitude', fmt(data.baroRelAlt ?? data.baroAlt, 1, ' m')),
       detailRow('GPS altitude', fmt(data.gpsAlt, 1, ' m')),
       detailRow('Barometric altitude', fmt(data.baroAlt, 1, ' m')),
       detailRow('IMU altitude', fmt(data.imuAlt, 1, ' m')),
       detailRow('Fused altitude', fmt(data.fusedAlt, 1, ' m')),
-      detailRow('Vertical velocity', fmt(data.verticalVelocity, 2, ' m/s')),
+      detailRow('Kalman velocity', fmt(data.kalmanVelocity ?? data.verticalVelocity, 2, ' m/s')),
       detailRow('IMU velocity', fmt(data.imuVelocity, 2, ' m/s')),
-      detailRow('Linear acceleration', fmt(data.linearAccel, 2, ' m/s^2')),
+      detailRow('Kalman acceleration', fmt(data.kalmanAccel ?? data.linearAccel, 2, ' m/s^2')),
+      detailRow('Raw linear acceleration', fmt(data.rawLinearAccel, 2, ' m/s^2')),
       detailRow('Accel magnitude', fmt(data.accelMagnitude, 2, ' m/s^2')),
       detailRow('Raw accel X', fmt(data.ax, 2, ' m/s^2')),
       detailRow('Raw accel Y', fmt(data.ay, 2, ' m/s^2')),
@@ -539,11 +552,16 @@
         stage.history.fusedRelAlt = recent.map((sample) => sample.fusedRelAlt ?? sample.fusedAlt ?? sample.baroRelAlt ?? sample.baroAlt ?? null);
         stage.history.velocity = recent.map((_, index) => velocityFromHistory(recent, index));
         stage.history.imuVelocity = recent.map((_, index) => imuVelocityFromHistory(recent, index));
+        stage.history.kalmanAlt = recent.map((sample) => sample.kalmanAlt ?? sample.fusedAlt ?? null);
+        stage.history.kalmanRelAlt = recent.map((sample) => sample.kalmanRelAlt ?? sample.fusedRelAlt ?? null);
+        stage.history.kalmanVelocity = recent.map((sample, index) => sample.kalmanVelocity ?? velocityFromHistory(recent, index));
+        stage.history.kalmanAccel = recent.map((sample) => sample.kalmanAccel ?? linearAccel(sample));
         stage.history.ax = recent.map((sample) => sample.ax ?? null);
         stage.history.ay = recent.map((sample) => sample.ay ?? null);
         stage.history.az = recent.map((sample) => sample.az ?? null);
         stage.history.accelMag = recent.map((sample) => sample.accelMagnitude ?? accelMag(sample));
         stage.history.linearAccel = recent.map(linearAccel);
+        stage.history.rawLinearAccel = recent.map((sample) => sample.rawLinearAccel ?? linearAccel(sample));
         stage.history.gx = recent.map((sample) => sample.gx ?? null);
         stage.history.gy = recent.map((sample) => sample.gy ?? null);
         stage.history.gz = recent.map((sample) => sample.gz ?? null);
@@ -655,7 +673,12 @@
       settingsInput('sensor.stationaryVelocityDeadbandMps', 'Stationary velocity deadband (m/s)', sensor.stationaryVelocityDeadbandMps ?? 0.35, '0.01'),
       settingsInput('sensor.maxBaroStepM', 'Max baro step (m)', sensor.maxBaroStepM ?? 25.0, '1'),
       settingsInput('sensor.maxGpsStepM', 'Max GPS step (m)', sensor.maxGpsStepM ?? 35.0, '1'),
-      settingsInput('sensor.maxGpsAltStepM', 'Max GPS altitude step (m)', sensor.maxGpsAltStepM ?? 30.0, '1')
+      settingsInput('sensor.maxGpsAltStepM', 'Max GPS altitude step (m)', sensor.maxGpsAltStepM ?? 30.0, '1'),
+      settingsInput('sensor.kalmanBaroVarianceM2', 'Kalman baro variance (m^2)', sensor.kalmanBaroVarianceM2 ?? 2.25, '0.01'),
+      settingsInput('sensor.kalmanAccelVarianceMps2', 'Kalman accel variance', sensor.kalmanAccelVarianceMps2 ?? 4.0, '0.01'),
+      settingsInput('sensor.kalmanProcessAltitude', 'Kalman altitude process', sensor.kalmanProcessAltitude ?? 0.08, '0.01'),
+      settingsInput('sensor.kalmanProcessVelocity', 'Kalman velocity process', sensor.kalmanProcessVelocity ?? 1.0, '0.01'),
+      settingsInput('sensor.kalmanProcessAccel', 'Kalman accel process', sensor.kalmanProcessAccel ?? 4.0, '0.01')
     ].join('');
     const eventFields = events.map((event, index) => {
       const numericFields = Object.keys(event)
