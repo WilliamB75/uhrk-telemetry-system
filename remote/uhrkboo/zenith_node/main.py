@@ -42,12 +42,13 @@ from .radio import LoRaRadio
 
 CONTROL_HOST = os.environ.get("UHRK_NODE_CONTROL_HOST", "0.0.0.0")
 CONTROL_PORT = int(os.environ.get("UHRK_NODE_CONTROL_PORT", "8091"))
-SHUTDOWN_PHRASE = os.environ.get("UHRK_SHUTDOWN_PHRASE", "SHUTDOWN UHRK")
 LOG_DIR = Path(os.environ.get("UHRK_FLIGHT_LOG_DIR", str(Path.home() / "flight_logs")))
 PAD_IDLE_FLAG = 1 << 6
 PAD_LAUNCH_READY_FLAG = 1 << 7
 PAD_IDLE = "idle"
 PAD_LAUNCH_READY = "launch_ready"
+# Compact GC-to-node command packets. These ride over the same RFM9x radio as
+# telemetry, so they must stay tiny and must be safe to repeat.
 COMMAND_MAGIC = b"UHRKC1"
 COMMAND_FORMAT = ">6sBBBH"
 COMMAND_LEN = struct.calcsize(COMMAND_FORMAT) + 2
@@ -66,6 +67,9 @@ def command_checksum(data: bytes) -> int:
 
 
 def decode_lora_command(packet: bytes, device_id: int) -> dict[str, int] | None:
+    """Validate and decode one LoRa downlink command for this node."""
+    # Adafruit RFM9x can include a 4-byte RadioHead-style header before the
+    # payload. The GC includes it for compatibility, so strip it if present.
     if len(packet) >= 4 + COMMAND_LEN and packet[4:10] == COMMAND_MAGIC:
         packet = packet[4:]
     if len(packet) != COMMAND_LEN or packet[:6] != COMMAND_MAGIC:
@@ -93,6 +97,11 @@ def handle_lora_command(
     flight_log: FlightLogger,
     stop_event: threading.Event,
 ) -> bool:
+    """Apply a validated LoRa command.
+
+    Returns True only when the command was understood. The caller uses that to
+    remember the nonce and ignore repeated downlink attempts from the GC.
+    """
     if command["commandId"] == COMMAND_PAD_STATE:
         if command["value"] == 0:
             mode = PAD_IDLE
@@ -128,6 +137,8 @@ def handle_lora_command(
             "nonce": command["nonce"],
         })
         if not dry_run:
+            # Log before stopping so recovery crews can confirm why the node
+            # shut down even if power is removed moments later.
             flight_log.append("shutdown_commit", response)
             stop_event.set()
             run_shutdown_after_delay(4.0)
@@ -155,6 +166,8 @@ class FlightLogger:
         with self._lock:
             self._file.write(line + "\n")
             self._file.flush()
+            # Flight logs matter more than write speed; force the current line
+            # to disk so a later power-down does not lose the latest packet.
             os.fsync(self._file.fileno())
 
     def close(self) -> None:
@@ -226,7 +239,7 @@ def set_system_time(epoch: float) -> dict[str, object]:
     return {"ok": False, "error": last_error}
 
 
-def start_control_server(stop_event: threading.Event, flight_log: FlightLogger, pad_state: PadState) -> ThreadingHTTPServer:
+def start_control_server(flight_log: FlightLogger, pad_state: PadState) -> ThreadingHTTPServer:
     class ControlHandler(BaseHTTPRequestHandler):
         server_version = "UHRKNodeControl/1.0"
 
@@ -260,17 +273,9 @@ def start_control_server(stop_event: threading.Event, flight_log: FlightLogger, 
                     "logPath": str(flight_log.path),
                 })
                 return
-            if path != "/api/shutdown/status":
-                self._send_json(404, {"ok": False, "error": "not found"})
-                return
-            self._send_json(200, {
-                "ok": True,
-                "hostname": socket.gethostname(),
-                "logPath": str(flight_log.path),
-                "confirmationPhrase": SHUTDOWN_PHRASE,
-                "holdMsRequired": 3000,
-                "padState": pad_state.snapshot(),
-            })
+            # Shutdown is intentionally not exposed over this WiFi API. The
+            # operational shutdown path is the guarded GC dashboard over LoRa.
+            self._send_json(404, {"ok": False, "error": "not found"})
 
         def do_POST(self) -> None:
             path = self.path.split("?", 1)[0]
@@ -309,43 +314,9 @@ def start_control_server(stop_event: threading.Event, flight_log: FlightLogger, 
                 })
                 self._send_json(200 if result.get("ok") else 500, result)
                 return
-            if path != "/api/shutdown":
-                self._send_json(404, {"ok": False, "error": "not found"})
-                return
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            try:
-                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-            except json.JSONDecodeError:
-                self._send_json(400, {"ok": False, "error": "invalid JSON"})
-                return
-
-            dry_run = bool(payload.get("dryRun"))
-            if payload.get("armed") is not True:
-                self._send_json(400, {"ok": False, "error": "shutdown is not armed"})
-                return
-            if payload.get("confirmation") != SHUTDOWN_PHRASE:
-                self._send_json(400, {"ok": False, "error": "confirmation phrase mismatch"})
-                return
-            if int(payload.get("holdMs") or 0) < 3000:
-                self._send_json(400, {"ok": False, "error": "hold duration too short"})
-                return
-
-            response = {
-                "ok": True,
-                "dryRun": dry_run,
-                "hostname": socket.gethostname(),
-                "logPath": str(flight_log.path),
-                "shutdownScheduled": not dry_run,
-            }
-            flight_log.append("shutdown_request", {
-                "dryRun": dry_run,
-                "remote": self.client_address[0],
-            })
-            if not dry_run:
-                flight_log.append("shutdown_commit", response)
-                stop_event.set()
-                run_shutdown_after_delay(4.0)
-            self._send_json(200, response)
+            # Keep the node HTTP API limited to bench functions. A flight or
+            # recovery shutdown should always go through the LoRa command path.
+            self._send_json(404, {"ok": False, "error": "not found"})
 
     server = ThreadingHTTPServer((CONTROL_HOST, CONTROL_PORT), ControlHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -359,7 +330,7 @@ def main() -> None:
     stop_event = threading.Event()
     flight_log = FlightLogger(LOG_DIR)
     pad_state = PadState()
-    control_server = start_control_server(stop_event, flight_log, pad_state)
+    control_server = start_control_server(flight_log, pad_state)
 
     def handle_signal(signum: int, _frame: object) -> None:
         flight_log.append("system", {"event": "signal", "signum": signum})
@@ -436,6 +407,8 @@ def main() -> None:
             # Advance sequence counter (wrap at 16 bits)
             seq = (seq + 1) & 0xFFFF
             # Listen for GC commands over LoRa until the next telemetry slot.
+            # This keeps command handling responsive without adding a second
+            # radio or thread that could fight the transmit path for SPI.
             if current_pad_state["onPadLaunchReady"]:
                 cadence = cfg.LAUNCH_READY_CADENCE_SECONDS + cfg.DEVICE_ID * cfg.LAUNCH_READY_DEVICE_SLOT_SECONDS
             else:

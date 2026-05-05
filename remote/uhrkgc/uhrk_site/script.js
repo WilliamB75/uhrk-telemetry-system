@@ -66,6 +66,8 @@
     ]
   };
 
+  // Client-side state mirrors telemetry_latest.json. The backend remains the
+  // source of truth; the browser only keeps enough history for charts.
   const stages = STAGE_NAMES.map((name, id) => ({
     id,
     name,
@@ -193,6 +195,8 @@
   }
 
   function linearAccel(sample) {
+    // Prefer backend-filtered acceleration. The fallback keeps old log files
+    // readable when they predate the Kalman fields.
     if (sample.linearAccel != null) return sample.linearAccel;
     const mag = sample.accelMagnitude != null ? sample.accelMagnitude : accelMag(sample);
     if (mag == null) return null;
@@ -369,6 +373,8 @@
   }
 
   function updateCharts() {
+    // General view compares stages; single-stage views expose the richer raw
+    // and filtered sensor signals for debugging.
     if (activeView === 'general') {
       const labels = longestLabels();
       altChart.data.labels = labels;
@@ -521,6 +527,8 @@
   }
 
   function processTelemetry(data) {
+    // Transform the backend's per-stage history into Chart.js friendly arrays.
+    // Nulls are kept as gaps so missing nodes do not draw misleading lines.
     const now = Date.now();
     if (data.ground_station) {
       const gs = data.ground_station;
@@ -665,6 +673,8 @@
     const sensor = settingsModel.sensor || {};
     const events = Array.isArray(settingsModel.events) ? settingsModel.events : [];
     const chutes = Array.isArray(settingsModel.chutes) ? settingsModel.chutes : [];
+    // Settings are intentionally rendered from the current model so new GC-side
+    // parameters can be added without creating static HTML for each one.
     const sensorFields = [
       settingsInput('sensor.gravityMps2', 'Gravity (m/s^2)', sensor.gravityMps2 ?? GRAVITY_REFERENCE, '0.0001'),
       settingsInput('sensor.linearAccelDeadbandMps2', 'Stationary accel deadband (m/s^2)', sensor.linearAccelDeadbandMps2 ?? LINEAR_ACCEL_DEADBAND, '0.01'),
@@ -991,6 +1001,8 @@
         updateShutdownControls('Arm the switch and type the exact phrase first.');
         return;
       }
+      // The real shutdown path requires the arm switch, exact phrase, and a
+      // continuous hold. Releasing before the timer finishes cancels locally.
       holdStarted = Date.now();
       shutdownStatusEl.textContent = 'Keep holding...';
       progressTimer = setInterval(() => {

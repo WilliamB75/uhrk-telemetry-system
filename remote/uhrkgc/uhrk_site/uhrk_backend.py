@@ -40,17 +40,9 @@ HISTORY_LENGTH = 50
 GROUND_GPS_PORT = os.environ.get("UHRK_GROUND_GPS_PORT", "/dev/ttyAMA0")
 CONTROL_HOST = os.environ.get("UHRK_CONTROL_HOST", "0.0.0.0")
 CONTROL_PORT = int(os.environ.get("UHRK_CONTROL_PORT", "8090"))
-NODE_CONTROL_URLS = [
-    url.strip()
-    for url in os.environ.get("UHRK_NODE_CONTROL_URLS", "http://10.42.0.78:8091/api/shutdown").split(",")
-    if url.strip()
-]
 NODE_TIME_SYNC_URLS = [
     url.strip()
-    for url in os.environ.get(
-        "UHRK_NODE_TIME_SYNC_URLS",
-        ",".join(url.rsplit("/", 1)[0] + "/time-sync" for url in NODE_CONTROL_URLS),
-    ).split(",")
+    for url in os.environ.get("UHRK_NODE_TIME_SYNC_URLS", "http://10.42.0.78:8091/api/time-sync").split(",")
     if url.strip()
 ]
 SHUTDOWN_PHRASE = os.environ.get("UHRK_SHUTDOWN_PHRASE", "SHUTDOWN UHRK")
@@ -288,6 +280,8 @@ class FlightLogger:
 
 
 class LoRaDownlink:
+    """Send small GC-to-node commands through the SX1303 packet forwarder."""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sock: Optional[socket.socket] = None
@@ -303,6 +297,9 @@ class LoRaDownlink:
             self._sock = sock
 
     def record_pull_data(self, data: bytes, addr: tuple[str, int]) -> None:
+        # The packet forwarder periodically sends PULL_DATA to tell us where
+        # PULL_RESP downlinks should be sent. Without a recent keepalive,
+        # downlink commands are refused rather than disappearing silently.
         gateway_id = gateway_id_from_push(data)
         with self._lock:
             self._addr = addr
@@ -349,6 +346,8 @@ class LoRaDownlink:
             self._nonce = (self._nonce + 1) & 0xFFFF
             nonce = self._nonce
 
+        # Repeating the same nonce improves odds of reception while letting
+        # nodes safely ignore duplicates.
         payload = pack_lora_command(COMMAND_BROADCAST_DEVICE, command_id, value, nonce)
         txpk = {
             "imme": True,
@@ -534,6 +533,7 @@ class StageState:
         return True
 
     def _reset_vertical_kalman(self, altitude_m: float, acceleration_mps2: float, baro_variance: float, accel_variance: float) -> None:
+        """Seed the vertical estimator from the latest trusted measurements."""
         self._kalman_x = [altitude_m, 0.0, acceleration_mps2]
         self._kalman_p = [
             [max(0.001, baro_variance), 0.0, 0.0],
@@ -542,6 +542,11 @@ class StageState:
         ]
 
     def _kalman_update_scalar(self, measurement: float, h: List[float], variance: float) -> None:
+        """Apply one scalar Kalman measurement update.
+
+        The state vector is [altitude, velocity, acceleration]. The h vector
+        selects which state component this measurement observes.
+        """
         if self._kalman_x is None or self._kalman_p is None:
             return
         p = self._kalman_p
@@ -573,6 +578,11 @@ class StageState:
         process_velocity: float,
         process_accel: float,
     ) -> None:
+        """Fuse baro altitude and gravity-corrected acceleration.
+
+        GPS altitude intentionally stays out of this estimator. It remains a
+        separate positioning signal until the GPS behavior is flight-proven.
+        """
         if self._kalman_x is None or self._kalman_p is None or dt is None or dt > 5.0:
             self._reset_vertical_kalman(altitude_m, acceleration_mps2, baro_variance, accel_variance)
         else:
@@ -627,6 +637,7 @@ class StageState:
         }
 
     def update_from_payload(self, decoded: Dict[str, object], rx_meta: Dict[str, object], now: float) -> None:
+        """Update one stage from a decoded telemetry packet and RX metadata."""
         previous_fused_alt = self.fusedRelAlt
         previous_update_mono = self.last_update_mono
         smoothing_alpha = max(0.0, min(1.0, sensor_float("velocitySmoothingAlpha", VELOCITY_SMOOTHING_ALPHA)))
@@ -656,6 +667,8 @@ class StageState:
         self.sats = int(decoded.get("sats", 0))
         self.satsUsed = int(decoded.get("sats_used", self.sats if gps_status_code > 0 and self.sats <= 15 else 0))
         self.satsInView = int(decoded.get("sats_in_view", self.sats))
+        # Accept GPS only after quality checks. Bad fixes still remain visible
+        # in GPS-specific fields, but they do not move the displayed position.
         gps_accepted = self._accept_gps(raw_lat, raw_lon, raw_gps_alt, gps_status_code, self.satsUsed or 0, max_gps_step_m, max_gps_alt_step_m)
         self.gpsQuality = "accepted" if gps_accepted else (self._last_gps_rejection or "not used")
         self.lat = self._accepted_lat if self._accepted_lat is not None else raw_lat
@@ -672,6 +685,8 @@ class StageState:
         self.ay = float(decoded["ay"])
         self.az = float(decoded["az"])
         self.accelMagnitude = math.sqrt(self.ax * self.ax + self.ay * self.ay + self.az * self.az)
+        # Current vertical acceleration is a practical approximation:
+        # magnitude minus gravity, not full attitude-resolved acceleration.
         self.rawLinearAccel = self.accelMagnitude - gravity_reference
         accel_measurement = self.rawLinearAccel
         if abs(accel_measurement) < linear_accel_deadband:
@@ -1265,31 +1280,6 @@ def handle_rxpk(rxpk: Dict[str, object], stages: Dict[int, StageState], now: flo
         flush=True,
     )
     return True
-
-
-def request_node_shutdown(url: str, dry_run: bool) -> Dict[str, object]:
-    body = json.dumps({
-        "armed": True,
-        "confirmation": SHUTDOWN_PHRASE,
-        "holdMs": 3000,
-        "dryRun": dry_run,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return {
-                "url": url,
-                "ok": 200 <= response.status < 300,
-                "status": response.status,
-                "response": json.loads(response.read().decode("utf-8") or "{}"),
-            }
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        return {"url": url, "ok": False, "error": str(exc)}
 
 
 def request_node_time_sync(url: str, epoch: float, source: str = "gc_gps") -> Dict[str, object]:

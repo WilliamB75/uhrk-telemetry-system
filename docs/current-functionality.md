@@ -191,12 +191,9 @@ Current endpoints:
 - `POST /api/pad-state`
 - `GET /api/time-sync/status`
 - `POST /api/time-sync`
-- `GET /api/shutdown/status`
-- `POST /api/shutdown`
 
-This API is still useful on the bench, especially for time sync and service
-testing, but flight-relevant pad state and shutdown are handled over LoRa from
-the GC dashboard.
+This API is still useful on the bench, especially for time sync and pad-state
+service testing. Shutdown is intentionally LoRa-only from the GC dashboard.
 
 ## Ground Station
 
@@ -527,7 +524,6 @@ Current service files include:
 - `uhrk-backend.service`
 - `uhrk-web.service`
 - `lora-pkt-fwd.service`
-- `lora-pkt-fwd-uhrk-override.conf`
 
 ## Helper Scripts
 
