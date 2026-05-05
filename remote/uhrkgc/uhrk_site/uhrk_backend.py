@@ -13,27 +13,37 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+import csv
+import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import math
 import os
+import shutil
 import socket
 import struct
 import subprocess
-import termios
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    import termios
+except ImportError:  # pragma: no cover - only used when helper tests run off-Pi.
+    termios = None  # type: ignore[assignment]
+
 
 UDP_HOST = os.environ.get("UHRK_UDP_HOST", "127.0.0.1")
 UDP_PORT = int(os.environ.get("UHRK_UDP_PORT", "1700"))
 OUTPUT_FILE = Path(__file__).resolve().parent / "telemetry_latest.json"
+APP_VERSION = os.environ.get("UHRK_VERSION", "2026.05.05-observability")
 WRITE_INTERVAL_S = 0.5
 OFFLINE_TIMEOUT_S = 10.0
 HISTORY_LENGTH = 50
@@ -444,7 +454,10 @@ class StageState:
     events: List[str] = field(default_factory=list)
     altitudeZero: Dict[str, Optional[float] | str] = field(default_factory=dict)
     readiness: Dict[str, object] = field(default_factory=dict)
+    warnings: List[Dict[str, str]] = field(default_factory=list)
     history: List[Dict[str, Optional[float] | str]] = field(default_factory=list)
+    packetsReceived: int = 0
+    packetRateHz: Optional[float] = None
     last_update_mono: float = 0.0
     last_update_utc: Optional[str] = None
     prev_event_mask: int = 0
@@ -456,6 +469,7 @@ class StageState:
     _last_gps_rejection: Optional[str] = None
     _kalman_x: Optional[List[float]] = None
     _kalman_p: Optional[List[List[float]]] = None
+    _packet_times: List[float] = field(default_factory=list)
 
     def apply_altitude_zero(self, zero: Dict[str, Any]) -> None:
         self.altitudeZero = {
@@ -636,8 +650,52 @@ class StageState:
             "lastSeenOk": self.last_update_mono > 0 and (now - self.last_update_mono) <= OFFLINE_TIMEOUT_S,
         }
 
+    def _update_packet_rate(self, now: float) -> None:
+        self.packetsReceived += 1
+        self._packet_times.append(now)
+        window_start = now - 30.0
+        self._packet_times = [stamp for stamp in self._packet_times if stamp >= window_start]
+        if len(self._packet_times) >= 2:
+            span = max(0.001, self._packet_times[-1] - self._packet_times[0])
+            self.packetRateHz = (len(self._packet_times) - 1) / span
+        else:
+            self.packetRateHz = 0.0
+
+    def _update_warnings(self, now: float) -> None:
+        warnings: List[Dict[str, str]] = []
+        if self.last_update_mono <= 0:
+            warnings.append({"severity": "warning", "code": "NO_TELEMETRY", "message": "No telemetry received"})
+        elif (now - self.last_update_mono) > OFFLINE_TIMEOUT_S:
+            warnings.append({"severity": "critical", "code": "STALE_TELEMETRY", "message": "Telemetry is stale"})
+        if self.gpsStatus != "3D fix":
+            in_view = self.satsInView if self.satsInView is not None else self.sats
+            used = self.satsUsed if self.satsUsed is not None else 0
+            if in_view and in_view >= 4:
+                warnings.append({
+                    "severity": "warning",
+                    "code": "GPS_NO_FIX",
+                    "message": f"GPS sees {in_view} sats but is using {used}",
+                })
+            else:
+                warnings.append({"severity": "info", "code": "GPS_WAITING", "message": "GPS has no 3D fix"})
+        if self.gpsQuality and self.gpsQuality not in ("accepted", "not used"):
+            warnings.append({"severity": "info", "code": "GPS_REJECTED", "message": self.gpsQuality})
+        if self._last_rejection:
+            warnings.append({"severity": "warning", "code": "BARO_REJECTED", "message": self._last_rejection})
+        if not (self.altitudeZero and self.altitudeZero.get("setUtc")):
+            warnings.append({"severity": "warning", "code": "ALTITUDE_ZERO_MISSING", "message": "Altitude zero is not set"})
+        if self.snr is not None and self.snr <= -5:
+            warnings.append({"severity": "critical", "code": "LORA_SNR_LOW", "message": f"SNR is {self.snr:.1f} dB"})
+        elif self.snr is not None and self.snr < 2:
+            warnings.append({"severity": "warning", "code": "LORA_SNR_WEAK", "message": f"SNR is {self.snr:.1f} dB"})
+        gyro = [value for value in (self.gx, self.gy, self.gz) if value is not None]
+        if gyro and max(abs(value) for value in gyro) > 1.0 and self.readiness.get("stationary"):
+            warnings.append({"severity": "warning", "code": "GYRO_BIAS", "message": "Stationary gyro bias exceeds 1 deg/s"})
+        self.warnings = warnings
+
     def update_from_payload(self, decoded: Dict[str, object], rx_meta: Dict[str, object], now: float) -> None:
         """Update one stage from a decoded telemetry packet and RX metadata."""
+        self._update_packet_rate(now)
         previous_fused_alt = self.fusedRelAlt
         previous_update_mono = self.last_update_mono
         smoothing_alpha = max(0.0, min(1.0, sensor_float("velocitySmoothingAlpha", VELOCITY_SMOOTHING_ALPHA)))
@@ -787,6 +845,7 @@ class StageState:
         self.last_update_mono = now
         self.last_update_utc = datetime.now(timezone.utc).isoformat()
         self._update_readiness(now)
+        self._update_warnings(now)
 
     def to_dict(self, now: float) -> Dict[str, object]:
         last_seen_ms: Optional[int]
@@ -795,6 +854,7 @@ class StageState:
         else:
             last_seen_ms = None
         self._update_readiness(now)
+        self._update_warnings(now)
         return {
             "id": self.id,
             "name": self.name,
@@ -839,7 +899,10 @@ class StageState:
             "events": self.events,
             "altitudeZero": self.altitudeZero,
             "readiness": self.readiness,
+            "warnings": self.warnings,
             "history": self.history,
+            "packetsReceived": self.packetsReceived,
+            "packetRateHz": self.packetRateHz,
             "lastSeenMs": last_seen_ms,
             "lastUpdateUtc": self.last_update_utc,
         }
@@ -966,6 +1029,8 @@ class GroundGpsReader:
             return dict(self._latest)
 
     def _configure_port(self, fd: int) -> None:
+        if termios is None:
+            return
         baud_const = getattr(termios, f"B{self.baud}", termios.B9600)
         attrs = termios.tcgetattr(fd)
         attrs[0] = termios.IGNPAR
@@ -1140,17 +1205,279 @@ def gateway_id_from_push(data: bytes) -> Optional[str]:
     return data[4:12].hex().upper()
 
 
-def write_json(stages: Dict[int, StageState], ground_station: Dict[str, object], now: float) -> None:
-    output = {
+def system_warnings(stages: Dict[int, StageState], ground_station: Dict[str, object], now: float) -> List[Dict[str, str]]:
+    warnings: List[Dict[str, str]] = []
+    active_count = sum(1 for stage in stages.values() if stage.last_update_mono > 0 and (now - stage.last_update_mono) <= OFFLINE_TIMEOUT_S)
+    if active_count == 0:
+        warnings.append({"severity": "critical", "code": "NO_NODES", "message": "No active node telemetry"})
+    elif active_count < len(stages):
+        warnings.append({"severity": "warning", "code": "NODES_MISSING", "message": f"{active_count}/{len(stages)} nodes are active"})
+    if ground_station.get("gpsStatus") != "Fix":
+        warnings.append({"severity": "warning", "code": "GC_GPS_NO_FIX", "message": "Ground station GPS has no fix"})
+    last_gps = ground_station.get("lastGpsUtc")
+    if not last_gps:
+        warnings.append({"severity": "info", "code": "GC_GPS_WAITING", "message": "No ground GPS sentence received yet"})
+    try:
+        usage = shutil.disk_usage(LOG_DIR)
+        free_mb = usage.free / (1024 * 1024)
+        if free_mb < 250:
+            warnings.append({"severity": "critical", "code": "LOG_STORAGE_LOW", "message": f"Only {free_mb:.0f} MB free for logs"})
+        elif free_mb < 1000:
+            warnings.append({"severity": "warning", "code": "LOG_STORAGE_WARN", "message": f"{free_mb:.0f} MB free for logs"})
+    except OSError:
+        warnings.append({"severity": "warning", "code": "LOG_STORAGE_UNKNOWN", "message": "Could not check log storage"})
+    return warnings
+
+
+def telemetry_snapshot(stages: Dict[int, StageState], ground_station: Dict[str, object], now: float) -> Dict[str, object]:
+    stage_snapshots = [stages[dev_id].to_dict(now) for dev_id in sorted(stages)]
+    return {
         "ground_station": ground_station,
-        "stages": [stages[dev_id].to_dict(now) for dev_id in sorted(stages)],
+        "stages": stage_snapshots,
         "pad_compare": {},
+        "system": {
+            "version": APP_VERSION,
+            "backendUtc": datetime.now(timezone.utc).isoformat(),
+            "outputFile": str(OUTPUT_FILE),
+        },
+        "warnings": system_warnings(stages, ground_station, now),
         "updatedUtc": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def write_json(stages: Dict[int, StageState], ground_station: Dict[str, object], now: float) -> None:
+    output = telemetry_snapshot(stages, ground_station, now)
     tmp_path = OUTPUT_FILE.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(output, f, separators=(",", ":"))
     os.replace(tmp_path, OUTPUT_FILE)
+
+
+def _service_state(name: str) -> str:
+    try:
+        result = subprocess.run(["systemctl", "is-active", name], check=False, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return (result.stdout.strip() or result.stderr.strip() or f"exit {result.returncode}")[:80]
+
+
+def _file_info(path: Path) -> Dict[str, object]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"path": str(path), "exists": False}
+    return {
+        "path": str(path),
+        "exists": True,
+        "sizeBytes": stat.st_size,
+        "modifiedUtc": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+    }
+
+
+def _storage_info(path: Path) -> Dict[str, object]:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError as exc:
+        return {"path": str(path), "ok": False, "error": str(exc)}
+    return {
+        "path": str(path),
+        "ok": True,
+        "totalBytes": usage.total,
+        "usedBytes": usage.used,
+        "freeBytes": usage.free,
+    }
+
+
+def health_snapshot(
+    stages: Dict[int, StageState],
+    ground_station: Dict[str, object],
+    flight_log: FlightLogger,
+    downlink: LoRaDownlink,
+    started_mono: float,
+) -> Dict[str, object]:
+    now = time.monotonic()
+    stage_snapshots = [stages[dev_id].to_dict(now) for dev_id in sorted(stages)]
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "backendUtc": datetime.now(timezone.utc).isoformat(),
+        "uptimeS": round(now - started_mono, 1),
+        "services": {
+            "uhrk-backend": _service_state("uhrk-backend"),
+            "uhrk-web": _service_state("uhrk-web"),
+            "lora-pkt-fwd": _service_state("lora-pkt-fwd"),
+        },
+        "files": {
+            "telemetry": _file_info(OUTPUT_FILE),
+            "gcLog": _file_info(flight_log.path),
+            "settings": _file_info(SETTINGS_FILE),
+            "altitudeZero": _file_info(ALTITUDE_ZERO_FILE),
+        },
+        "storage": _storage_info(LOG_DIR),
+        "downlink": downlink.snapshot(),
+        "groundStation": ground_station,
+        "stages": stage_snapshots,
+        "warnings": system_warnings(stages, ground_station, now),
+    }
+
+
+def log_list_snapshot(flight_log: FlightLogger) -> Dict[str, object]:
+    logs: List[Dict[str, object]] = []
+    try:
+        candidates = sorted(LOG_DIR.glob("*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)
+    except OSError:
+        candidates = []
+    for path in candidates[:50]:
+        logs.append(_file_info(path))
+    return {"ok": True, "current": str(flight_log.path), "logs": logs}
+
+
+def _iter_log_records(path: Path) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        pass
+    return records
+
+
+def _valid_coord(lat: object, lon: object) -> bool:
+    lat_f = _maybe_float(lat)
+    lon_f = _maybe_float(lon)
+    if lat_f is None or lon_f is None:
+        return False
+    if not (-90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0):
+        return False
+    return not (abs(lat_f) < 0.000001 and abs(lon_f) < 0.000001)
+
+
+def export_csv_from_log(path: Path) -> bytes:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        "source",
+        "stage",
+        "deviceId",
+        "loggedUtc",
+        "seq",
+        "lat",
+        "lon",
+        "altitudeM",
+        "gpsStatus",
+        "satsUsed",
+        "satsInView",
+        "rssi",
+        "snr",
+        "baroAltM",
+        "imuAltM",
+        "eventFlags",
+    ])
+    writer.writeheader()
+    for record in _iter_log_records(path):
+        logged_utc = record.get("loggedUtc")
+        data = record.get("data") if isinstance(record.get("data"), dict) else {}
+        if record.get("type") == "packet":
+            decoded = data.get("decoded") if isinstance(data.get("decoded"), dict) else {}
+            rx_meta = data.get("rxMeta") if isinstance(data.get("rxMeta"), dict) else {}
+            writer.writerow({
+                "source": "node",
+                "stage": data.get("stage"),
+                "deviceId": data.get("deviceId"),
+                "loggedUtc": logged_utc,
+                "seq": decoded.get("seq"),
+                "lat": decoded.get("lat"),
+                "lon": decoded.get("lon"),
+                "altitudeM": decoded.get("gps_alt_m"),
+                "gpsStatus": decoded.get("gps_status"),
+                "satsUsed": decoded.get("sats_used"),
+                "satsInView": decoded.get("sats_in_view"),
+                "rssi": rx_meta.get("rssi"),
+                "snr": rx_meta.get("lsnr"),
+                "baroAltM": decoded.get("baro_alt_m"),
+                "imuAltM": decoded.get("imu_alt_m"),
+                "eventFlags": decoded.get("event_flags"),
+            })
+        elif record.get("type") == "ground_snapshot":
+            ground = data.get("groundStation") if isinstance(data.get("groundStation"), dict) else {}
+            writer.writerow({
+                "source": "ground_station",
+                "stage": "Ground Station",
+                "deviceId": "",
+                "loggedUtc": logged_utc,
+                "seq": "",
+                "lat": ground.get("lat"),
+                "lon": ground.get("lon"),
+                "altitudeM": ground.get("altitudeM"),
+                "gpsStatus": ground.get("gpsStatus"),
+                "satsUsed": ground.get("sats"),
+                "satsInView": ground.get("sats"),
+                "rssi": "",
+                "snr": "",
+                "baroAltM": "",
+                "imuAltM": "",
+                "eventFlags": "",
+            })
+    return output.getvalue().encode("utf-8")
+
+
+def export_kml_from_log(path: Path) -> bytes:
+    tracks: Dict[str, List[tuple[float, float, float, str]]] = {}
+    for record in _iter_log_records(path):
+        logged_utc = str(record.get("loggedUtc") or "")
+        data = record.get("data") if isinstance(record.get("data"), dict) else {}
+        if record.get("type") == "packet":
+            decoded = data.get("decoded") if isinstance(data.get("decoded"), dict) else {}
+            if not _valid_coord(decoded.get("lat"), decoded.get("lon")):
+                continue
+            stage = str(data.get("stage") or f"Node {data.get('deviceId', '')}").strip()
+            lat = float(decoded.get("lat"))
+            lon = float(decoded.get("lon"))
+            alt = float(_maybe_float(decoded.get("gps_alt_m")) or 0.0)
+            tracks.setdefault(stage, []).append((lon, lat, alt, logged_utc))
+        elif record.get("type") == "ground_snapshot":
+            ground = data.get("groundStation") if isinstance(data.get("groundStation"), dict) else {}
+            if not _valid_coord(ground.get("lat"), ground.get("lon")):
+                continue
+            lat = float(ground.get("lat"))
+            lon = float(ground.get("lon"))
+            alt = float(_maybe_float(ground.get("altitudeM")) or 0.0)
+            tracks.setdefault("Ground Station", []).append((lon, lat, alt, logged_utc))
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<kml xmlns="http://www.opengis.net/kml/2.2">',
+        "<Document>",
+        "<name>UHRK telemetry tracks</name>",
+    ]
+    for name, points in sorted(tracks.items()):
+        if not points:
+            continue
+        safe_name = html.escape(name)
+        coords = " ".join(f"{lon:.7f},{lat:.7f},{alt:.2f}" for lon, lat, alt, _stamp in points)
+        parts.extend([
+            "<Placemark>",
+            f"<name>{safe_name}</name>",
+            "<LineString><tessellate>1</tessellate>",
+            f"<coordinates>{coords}</coordinates>",
+            "</LineString>",
+            "</Placemark>",
+        ])
+        lon, lat, alt, stamp = points[-1]
+        parts.extend([
+            "<Placemark>",
+            f"<name>{safe_name} latest</name>",
+            f"<description>{html.escape(stamp)}</description>",
+            f"<Point><coordinates>{lon:.7f},{lat:.7f},{alt:.2f}</coordinates></Point>",
+            "</Placemark>",
+        ])
+    parts.extend(["</Document>", "</kml>"])
+    return ("\n".join(parts) + "\n").encode("utf-8")
 
 
 def pad_state_nodes(stages: Dict[int, StageState], now: float) -> List[Dict[str, object]]:
@@ -1335,6 +1662,7 @@ def start_control_server(
     ground_station: Dict[str, object],
     flight_log: FlightLogger,
     downlink: LoRaDownlink,
+    started_mono: float,
 ) -> ThreadingHTTPServer:
     class ControlHandler(BaseHTTPRequestHandler):
         server_version = "UHRKControl/1.0"
@@ -1353,13 +1681,50 @@ def start_control_server(
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_bytes(self, status: int, body: bytes, content_type: str, filename: Optional[str] = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            if filename:
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_OPTIONS(self) -> None:
             self._send_json(204, {})
 
         def do_GET(self) -> None:
-            path = self.path.split("?", 1)[0]
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
             if path == "/api/settings":
                 self._send_json(200, {"ok": True, "settings": load_settings()})
+                return
+            if path == "/api/version":
+                self._send_json(200, {"ok": True, "version": APP_VERSION})
+                return
+            if path == "/api/health":
+                self._send_json(200, health_snapshot(stages, ground_station, flight_log, downlink, started_mono))
+                return
+            if path == "/api/logs":
+                self._send_json(200, log_list_snapshot(flight_log))
+                return
+            if path == "/api/logs/current":
+                try:
+                    body = flight_log.path.read_bytes()
+                except OSError as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                    return
+                self._send_bytes(200, body, "application/x-ndjson; charset=utf-8", flight_log.path.name)
+                return
+            if path == "/api/export/csv":
+                body = export_csv_from_log(flight_log.path)
+                self._send_bytes(200, body, "text/csv; charset=utf-8", f"{flight_log.path.stem}.csv")
+                return
+            if path == "/api/export/kml":
+                body = export_kml_from_log(flight_log.path)
+                self._send_bytes(200, body, "application/vnd.google-earth.kml+xml; charset=utf-8", f"{flight_log.path.stem}.kml")
                 return
             if path == "/api/altitude-zero":
                 self._send_json(200, altitude_zero_snapshot(stages, time.monotonic()))
@@ -1574,6 +1939,7 @@ def start_control_server(
 
 
 def main() -> None:
+    started_mono = time.monotonic()
     flight_log = FlightLogger(LOG_DIR, "gc")
     stages = {
         dev_id: StageState(id=dev_id, name=STAGE_NAMES[dev_id], deviceId=dev_id)
@@ -1601,7 +1967,7 @@ def main() -> None:
     }
     ground_gps = GroundGpsReader(GROUND_GPS_PORT)
     downlink = LoRaDownlink()
-    control_server = start_control_server(stages, ground_station, flight_log, downlink)
+    control_server = start_control_server(stages, ground_station, flight_log, downlink, started_mono)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>UHRK Flight Monitor</title>
-  <link rel="stylesheet" href="styles.css?v=20260505-1">
+  <link rel="stylesheet" href="styles.css?v=20260505-2">
   <script src="vendor/chart.umd.min.js?v=4.4.0"></script>
 </head>
 <body>
@@ -68,6 +68,24 @@
         <div class="info"><strong>Altitude:</strong> <span id="gs-altitude">-</span> m</div>
       </section>
 
+      <section class="system-panel" id="system-panel">
+        <h2>System Status</h2>
+        <div class="info"><strong>Version:</strong> <span id="system-version">-</span></div>
+        <div class="info"><strong>Last update:</strong> <span id="system-updated">-</span></div>
+        <div id="system-warnings" class="warning-list"></div>
+      </section>
+
+      <section class="export-panel" id="export-panel">
+        <h2>Data Export</h2>
+        <div class="export-actions">
+          <a id="export-telemetry" href="/telemetry_latest.json" download>Telemetry JSON</a>
+          <a id="export-log" href="#">GC log</a>
+          <a id="export-csv" href="#">CSV</a>
+          <a id="export-kml" href="#">KML</a>
+          <a id="export-health" href="#">Health JSON</a>
+        </div>
+      </section>
+
       <section class="shutdown-panel" id="shutdown-panel">
         <h2>System Shutdown</h2>
         <label class="safety-row">
@@ -106,8 +124,8 @@
   </aside>
 
   <footer>
-    <p>UHRK Rocketry Telemetry</p>
+    <p>UHRK Rocketry Telemetry <span id="footer-version"></span></p>
   </footer>
-  <script src="script.js?v=20260505-1"></script>
+  <script src="script.js?v=20260505-2"></script>
 </body>
 </html>

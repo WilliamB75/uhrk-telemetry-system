@@ -10,11 +10,13 @@
   const MAX_HISTORY = 80;
   const SHUTDOWN_PHRASE = 'SHUTDOWN UHRK';
   const SHUTDOWN_HOLD_MS = 3000;
-  const CONTROL_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/shutdown';
-  const SETTINGS_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/settings';
-  const PAD_STATE_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/pad-state';
-  const ALTITUDE_ZERO_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/altitude-zero';
-  const TIME_SYNC_API = window.location.protocol + '//' + window.location.hostname + ':8090/api/time-sync';
+  const CONTROL_ORIGIN = window.location.protocol + '//' + window.location.hostname + ':8090';
+  const CONTROL_API = CONTROL_ORIGIN + '/api/shutdown';
+  const SETTINGS_API = CONTROL_ORIGIN + '/api/settings';
+  const PAD_STATE_API = CONTROL_ORIGIN + '/api/pad-state';
+  const ALTITUDE_ZERO_API = CONTROL_ORIGIN + '/api/altitude-zero';
+  const TIME_SYNC_API = CONTROL_ORIGIN + '/api/time-sync';
+  const HEALTH_API = CONTROL_ORIGIN + '/api/health';
   const THEME_KEY = 'uhrk-dashboard-theme';
   const GRAVITY_REFERENCE = 9.80665;
   const LINEAR_ACCEL_DEADBAND = 0.25;
@@ -111,13 +113,24 @@
     lon: null,
     altitudeM: null
   };
+  let systemInfo = {};
+  let systemWarnings = [];
 
   const tabs = document.querySelectorAll('#stage-tabs button');
   const viewContentEl = document.getElementById('view-content');
+  const chartsEl = document.querySelector('.charts');
   const gsGpsStatusEl = document.getElementById('gs-gps-status');
   const gsSatsEl = document.getElementById('gs-sats');
   const gsPositionEl = document.getElementById('gs-position');
   const gsAltitudeEl = document.getElementById('gs-altitude');
+  const systemVersionEl = document.getElementById('system-version');
+  const systemUpdatedEl = document.getElementById('system-updated');
+  const systemWarningsEl = document.getElementById('system-warnings');
+  const footerVersionEl = document.getElementById('footer-version');
+  const exportLogEl = document.getElementById('export-log');
+  const exportCsvEl = document.getElementById('export-csv');
+  const exportKmlEl = document.getElementById('export-kml');
+  const exportHealthEl = document.getElementById('export-health');
   const themeToggleEl = document.getElementById('theme-toggle');
   const settingsToggleEl = document.getElementById('settings-toggle');
   const settingsCloseEl = document.getElementById('settings-close');
@@ -182,6 +195,33 @@
 
   function zeroText(data) {
     return data.altitudeZero && data.altitudeZero.setUtc ? 'Set' : 'Not set';
+  }
+
+  function packetRateText(data) {
+    if (data.packetRateHz == null) return '-';
+    const rate = Number(data.packetRateHz);
+    if (!Number.isFinite(rate)) return '-';
+    if (rate < 1) return rate.toFixed(2) + ' Hz';
+    return rate.toFixed(1) + ' Hz';
+  }
+
+  function warningClass(warning) {
+    const severity = warning && warning.severity ? warning.severity : 'info';
+    if (severity === 'critical') return 'critical';
+    if (severity === 'warning') return 'warning';
+    return 'info';
+  }
+
+  function warningItem(warning) {
+    const message = warning && warning.message ? warning.message : 'Unknown warning';
+    return '<li class="' + warningClass(warning) + '">' + esc(message) + '</li>';
+  }
+
+  function warningList(warnings, emptyText) {
+    if (!Array.isArray(warnings) || warnings.length === 0) {
+      return '<p class="status-note ok">' + esc(emptyText || 'No active warnings') + '</p>';
+    }
+    return '<ul class="warning-list compact">' + warnings.map(warningItem).join('') + '</ul>';
   }
 
   function cssVar(name, fallback) {
@@ -312,7 +352,7 @@
 
   function initCharts() {
     if (typeof Chart === 'undefined') {
-      chartsEl.innerHTML = '<div class="chart-error">Chart library failed to load from the ground station.</div>';
+      if (chartsEl) chartsEl.innerHTML = '<div class="chart-error">Chart library failed to load from the ground station.</div>';
       throw new Error('Chart.js is not available');
     }
     const baseOptions = () => ({
@@ -444,10 +484,12 @@
       '<div><dt>IMU velocity</dt><dd>' + fmt(data.imuVelocity, 2, ' m/s') + '</dd></div>',
       '<div><dt>Kalman accel</dt><dd>' + fmt(data.kalmanAccel ?? data.linearAccel, 2, ' m/s^2') + '</dd></div>',
       '<div><dt>RSSI | SNR</dt><dd>' + signalQuality(data) + '</dd></div>',
+      '<div><dt>Packet rate</dt><dd>' + packetRateText(data) + '</dd></div>',
       '<div><dt>Pad zero</dt><dd>' + zeroText(data) + '</dd></div>',
       '<div><dt>Readiness</dt><dd>' + readinessText(data) + '</dd></div>',
       '</dl>',
       '<p class="events-line">' + (events.length ? events.join(', ') : 'No events') + '</p>',
+      warningList(data.warnings, 'No node warnings'),
       '</article>'
     ].join('');
   }
@@ -478,6 +520,8 @@
       detailRow('Sequence', fmtRaw(data.seq)),
       detailRow('Last seen', data.lastSeenMs != null ? fmt(data.lastSeenMs / 1000, 1, ' s ago') : '-'),
       detailRow('Last update UTC', fmtRaw(data.lastUpdateUtc)),
+      detailRow('Packets received', fmtRaw(data.packetsReceived)),
+      detailRow('Packet rate', packetRateText(data)),
       detailRow('GPS status', fmtRaw(data.gpsStatus)),
       detailRow('Satellites used | view', satelliteSummary(data)),
       detailRow('GPS quality', fmtRaw(data.gpsQuality)),
@@ -508,6 +552,8 @@
       detailRow('Data rate', fmtRaw(data.dataRate)),
       detailRow('Events', events.length ? events.join(', ') : '-'),
       '</dl>',
+      '<h2 class="subsection-title">Node Warnings</h2>',
+      warningList(data.warnings, 'No node warnings'),
       '</section>'
     ].join('');
   }
@@ -519,6 +565,14 @@
     gsAltitudeEl.textContent = fmt(groundStation.altitudeM, 1);
   }
 
+  function updateSystemPanel() {
+    const version = systemInfo.version || '-';
+    if (systemVersionEl) systemVersionEl.textContent = version;
+    if (systemUpdatedEl) systemUpdatedEl.textContent = systemInfo.updatedUtc || systemInfo.backendUtc || '-';
+    if (footerVersionEl) footerVersionEl.textContent = version && version !== '-' ? ' | ' + version : '';
+    if (systemWarningsEl) systemWarningsEl.innerHTML = warningList(systemWarnings, 'No system warnings');
+  }
+
   function updateUI() {
     updateTabs();
     if (activeView === 'general') {
@@ -527,6 +581,7 @@
       renderStageDetail(stages[Number(activeView)]);
     }
     updateGroundStation();
+    updateSystemPanel();
     updateCharts();
   }
 
@@ -534,6 +589,8 @@
     // Transform the backend's per-stage history into Chart.js friendly arrays.
     // Nulls are kept as gaps so missing nodes do not draw misleading lines.
     const now = Date.now();
+    systemInfo = Object.assign({}, data.system || {}, { updatedUtc: data.updatedUtc });
+    systemWarnings = Array.isArray(data.warnings) ? data.warnings : [];
     if (data.ground_station) {
       const gs = data.ground_station;
       groundStation = {
@@ -1033,8 +1090,16 @@
     updateShutdownControls();
   }
 
+  function initExportLinks() {
+    if (exportLogEl) exportLogEl.href = CONTROL_ORIGIN + '/api/logs/current';
+    if (exportCsvEl) exportCsvEl.href = CONTROL_ORIGIN + '/api/export/csv';
+    if (exportKmlEl) exportKmlEl.href = CONTROL_ORIGIN + '/api/export/kml';
+    if (exportHealthEl) exportHealthEl.href = HEALTH_API;
+  }
+
   function init() {
     initTheme();
+    initExportLinks();
     initCharts();
     tabs.forEach((btn) => {
       btn.addEventListener('click', () => {

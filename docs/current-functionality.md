@@ -505,10 +505,54 @@ The dashboard supports:
 - Detailed individual stage tabs
 - Settings drawer
 - Shutdown safety panel
+- System status panel
+- Active warning summaries
+- Packet-rate display per node
+- Data export links for telemetry JSON, current GC log, CSV, KML, and health JSON
 
 The current layout is intentionally kept stable: controls and data presentation
 should not be moved casually because the dashboard is becoming an operational
 interface, not a mock-up.
+
+### Diagnostics And Exports
+
+The GC control API exposes read-only diagnostics and export endpoints:
+
+```text
+GET /api/version
+GET /api/health
+GET /api/logs
+GET /api/logs/current
+GET /api/export/csv
+GET /api/export/kml
+```
+
+`/api/health` reports backend version, uptime, service states, important file
+paths, downlink status, ground-station GPS state, stage snapshots, and active
+warnings.
+
+`/api/export/csv` and `/api/export/kml` are generated from the current GC JSONL
+flight log. The KML includes any valid non-zero node GPS tracks and the ground
+station track, so GPS outages appear as missing segments rather than false
+`0,0` lines.
+
+### Warning Logic
+
+The backend adds warning summaries to telemetry output and health output.
+Current warnings cover:
+
+- missing or stale telemetry
+- nodes missing from the expected three-stage set
+- GC GPS not fixed or not yet streaming
+- node GPS seeing satellites without a usable 3D fix
+- rejected GPS/baro measurements
+- missing altitude zero
+- low GC log storage
+- weak LoRa SNR
+- possible gyro bias while stationary
+
+These warnings are advisory. They do not currently gate launch events or change
+node-side flight logic.
 
 ## Service Files
 

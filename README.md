@@ -30,6 +30,15 @@ When the ground station is running, the dashboard is served from:
 http://10.42.0.1:8000/
 ```
 
+The GC control/diagnostics API is served from:
+
+```text
+http://10.42.0.1:8090/
+```
+
+Useful read-only endpoints include `/api/health`, `/api/logs/current`,
+`/api/export/csv`, and `/api/export/kml`.
+
 ## Functionality Reference
 
 The current data logger and ground-station capability summary is maintained in
