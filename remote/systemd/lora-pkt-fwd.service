@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=uhrkgc
 WorkingDirectory=/opt/sx1302_hal/packet_forwarder
-ExecStart=/opt/sx1302_hal/packet_forwarder/lora_pkt_fwd -c /opt/sx1302_hal/packet_forwarder/test_conf.json
+ExecStart=/opt/sx1302_hal/packet_forwarder/lora_pkt_fwd -c /opt/sx1302_hal/packet_forwarder/test_conf.jsonc
 Restart=always
 RestartSec=5
 

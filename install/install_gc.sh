@@ -148,14 +148,14 @@ EOF
 if [[ -n "$gateway_dir" ]]; then
   packet_forwarder_dir="${gateway_dir}/packet_forwarder"
   packet_forwarder_bin="${packet_forwarder_dir}/lora_pkt_fwd"
-  packet_forwarder_conf="${packet_forwarder_dir}/test_conf.json"
+  packet_forwarder_conf="${packet_forwarder_dir}/test_conf.jsonc"
   if [[ ! -x "$packet_forwarder_bin" ]]; then
     echo "Gateway binary not found or not executable: $packet_forwarder_bin" >&2
     echo "Install/build the SX1302/SX1303 HAL first, then rerun with --gateway-dir." >&2
     exit 1
   fi
-  if [[ -f "${repo_root}/remote/uhrkgc/test_conf.json" ]]; then
-    cp "${repo_root}/remote/uhrkgc/test_conf.json" "$packet_forwarder_conf"
+  if [[ -f "${repo_root}/remote/uhrkgc/test_conf.jsonc" ]]; then
+    cp "${repo_root}/remote/uhrkgc/test_conf.jsonc" "$packet_forwarder_conf"
   fi
   cat >/etc/systemd/system/lora-pkt-fwd.service <<EOF
 [Unit]
