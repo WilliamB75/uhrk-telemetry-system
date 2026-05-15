@@ -607,6 +607,13 @@
         const stage = stages[id];
         if (!stage) return;
         stage.data = rec;
+        if (window.updateMapPosition) {
+          window.updateMapPosition(
+            stage.id,
+            rec.lat,
+            rec.lon
+          );
+        }
         stage.connected = typeof rec.lastSeenMs === 'number' && rec.lastSeenMs <= OFFLINE_THRESHOLD;
         stage.lastUpdate = stage.connected ? now - rec.lastSeenMs : 0;
         const recent = Array.isArray(rec.history) ? rec.history.slice(-MAX_HISTORY) : [];
