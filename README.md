@@ -53,6 +53,7 @@ Install scripts live in `install/`:
 
 - `install/install_node.sh` - install a telemetry node service
 - `install/install_gc.sh` - install the ground-station backend/dashboard
+- `install/setup_gc_hotspot.sh` - configure the GC WiFi hotspot on `10.42.0.1`
 
 ## Notes
 

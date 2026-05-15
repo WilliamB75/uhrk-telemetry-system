@@ -140,7 +140,8 @@ Example:
 sudo ./install/install_gc.sh \
   --user uhrkgc \
   --gateway-dir /home/uhrkgc/gateway/sx1302_hal_rpi5-master \
-  --gps-port /dev/ttyAMA0
+  --gps-port /dev/ttyAMA0 \
+  --setup-hotspot
 ```
 
 If the gateway HAL is not ready yet:
@@ -160,6 +161,7 @@ The GC installer:
 - Installs `uhrk-backend.service`
 - Installs `uhrk-web.service`
 - Optionally installs `lora-pkt-fwd.service`
+- Optionally configures the WiFi hotspot with `--setup-hotspot`
 - Adds limited passwordless sudo for shutdown and clock setting
 - Enables and starts the installed services
 
@@ -177,6 +179,33 @@ Dashboard:
 ```text
 http://<ground-station-ip>:8000/
 ```
+
+If `--setup-hotspot` was used, join the GC hotspot from the laptop/phone and
+open:
+
+```text
+http://10.42.0.1:8000/
+```
+
+Default hotspot settings:
+
+- SSID: `UHRK-GC`
+- Password: `uhrk1234`
+- Pi address: `10.42.0.1/24`
+- Band: 2.4 GHz
+- Channel: 6
+
+You can configure only the hotspot without reinstalling the GC services:
+
+```bash
+sudo ./install/setup_gc_hotspot.sh \
+  --ssid UHRK-GC \
+  --password uhrk1234 \
+  --interface wlan0
+```
+
+The hotspot script uses NetworkManager `ipv4.method shared`, which gives the Pi
+`10.42.0.1` and provides DHCP to connected laptops/phones.
 
 GC logs are written to:
 
@@ -231,7 +260,7 @@ The repository is now much closer to clone-and-install, but a few areas still
 depend on the exact Pi image and hardware:
 
 - The SX1303/SX1302 HAL build is not vendored into this repo.
-- Network/hotspot setup is not automated.
+- Network/hotspot setup is automated only when `--setup-hotspot` is used.
 - `raspi-config` interface setup is documented rather than forced.
 - Multi-frequency gateway channel configuration is not automated yet.
 - Existing hand-built Pis may still use `/home/uhrkgc` and `/home/uhrkboo`
@@ -252,6 +281,7 @@ GC:
 systemctl is-active uhrk-backend
 systemctl is-active uhrk-web
 curl http://localhost:8000/telemetry_latest.json
+curl http://localhost:8090/api/health
 ```
 
 Packet forwarder:
@@ -260,3 +290,54 @@ Packet forwarder:
 systemctl is-active lora-pkt-fwd
 journalctl -u lora-pkt-fwd -n 100
 ```
+
+Hotspot:
+
+```bash
+nmcli connection show --active
+nmcli device status
+ip addr show wlan0
+iw dev wlan0 info
+```
+
+Expected result when the hotspot is active:
+
+- Active NetworkManager connection named `uhrk-gc-hotspot`
+- WiFi interface mode is `AP`
+- `wlan0` has `10.42.0.1/24`
+
+## Hotspot Troubleshooting
+
+If the GC network does not appear on a different PC or phone:
+
+1. Check the GC hotspot is active:
+
+   ```bash
+   nmcli connection show --active
+   ```
+
+2. Restart the hotspot connection:
+
+   ```bash
+   sudo nmcli connection down uhrk-gc-hotspot
+   sudo nmcli connection up uhrk-gc-hotspot
+   ```
+
+3. Confirm the interface is broadcasting as an access point:
+
+   ```bash
+   iw dev wlan0 info
+   ```
+
+4. Keep the hotspot on 2.4 GHz. Some laptops and phones will not show a Pi AP if
+   it is accidentally configured for an unsupported/DFS 5 GHz channel.
+
+5. If the PC joins the hotspot but the dashboard still does not open, check the
+   PC received a `10.42.0.x` address and open:
+
+   ```text
+   http://10.42.0.1:8000/
+   ```
+
+6. If the SSID is visible on phones but not one Windows laptop, update/enable
+   that laptop's WiFi adapter and check it supports 2.4 GHz WPA2-PSK networks.

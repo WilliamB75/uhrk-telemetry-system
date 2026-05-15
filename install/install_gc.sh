@@ -12,6 +12,11 @@ Options:
   --site-dir PATH       Dashboard/backend install dir, default /opt/uhrk/uhrk_site
   --gateway-dir PATH    Optional sx1302/sx1303 HAL root containing packet_forwarder/
   --gps-port PATH       Ground GPS serial port, default /dev/ttyAMA0
+  --setup-hotspot       Configure a 2.4 GHz NetworkManager hotspot on 10.42.0.1
+  --hotspot-ssid NAME   Hotspot SSID, default UHRK-GC
+  --hotspot-pass PASS   Hotspot WPA2 password, default uhrk1234
+  --hotspot-iface IFACE WiFi interface, default auto-detect or wlan0
+  --hotspot-channel N   2.4 GHz channel, default 6
   --help                Show this help
 
 Example:
@@ -31,6 +36,11 @@ user_name="${UHRK_GC_USER:-uhrkgc}"
 site_dir="${UHRK_SITE_DIR:-/opt/uhrk/uhrk_site}"
 gateway_dir="${UHRK_GATEWAY_DIR:-}"
 gps_port="${UHRK_GROUND_GPS_PORT:-/dev/ttyAMA0}"
+setup_hotspot=0
+hotspot_ssid="${UHRK_GC_HOTSPOT_SSID:-UHRK-GC}"
+hotspot_pass="${UHRK_GC_HOTSPOT_PASSWORD:-uhrk1234}"
+hotspot_iface="${UHRK_GC_HOTSPOT_IFACE:-}"
+hotspot_channel="${UHRK_GC_HOTSPOT_CHANNEL:-6}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +48,11 @@ while [[ $# -gt 0 ]]; do
     --site-dir) site_dir="$2"; shift 2 ;;
     --gateway-dir) gateway_dir="$2"; shift 2 ;;
     --gps-port) gps_port="$2"; shift 2 ;;
+    --setup-hotspot) setup_hotspot=1; shift ;;
+    --hotspot-ssid) hotspot_ssid="$2"; shift 2 ;;
+    --hotspot-pass) hotspot_pass="$2"; shift 2 ;;
+    --hotspot-iface) hotspot_iface="$2"; shift 2 ;;
+    --hotspot-channel) hotspot_channel="$2"; shift 2 ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -61,7 +76,7 @@ for group_name in spi i2c dialout gpio; do
 done
 
 apt-get update
-apt-get install -y python3 git
+apt-get install -y python3 git network-manager wireless-tools iw
 
 mkdir -p "$(dirname "$site_dir")" /etc/uhrk
 state_tmp=""
@@ -184,6 +199,14 @@ visudo -cf /etc/sudoers.d/uhrk-gc
 
 chown -R "${user_name}:${user_name}" "$site_dir"
 
+if [[ "$setup_hotspot" -eq 1 ]]; then
+  hotspot_args=(--ssid "$hotspot_ssid" --password "$hotspot_pass" --channel "$hotspot_channel")
+  if [[ -n "$hotspot_iface" ]]; then
+    hotspot_args+=(--interface "$hotspot_iface")
+  fi
+  "${repo_root}/install/setup_gc_hotspot.sh" "${hotspot_args[@]}"
+fi
+
 systemctl daemon-reload
 systemctl enable uhrk-backend.service uhrk-web.service
 systemctl restart uhrk-backend.service uhrk-web.service
@@ -194,6 +217,9 @@ fi
 
 echo "UHRK ground station installed."
 echo "Dashboard: http://<ground-station-ip>:8000/"
+if [[ "$setup_hotspot" -eq 1 ]]; then
+  echo "Hotspot dashboard: http://10.42.0.1:8000/"
+fi
 echo "Backend service: systemctl status uhrk-backend"
 echo "Web service: systemctl status uhrk-web"
 echo "Environment: /etc/uhrk/gc.env"
